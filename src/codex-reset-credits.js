@@ -472,6 +472,47 @@ export class ResetCreditRedeemer {
   }
 
   /**
+   * Spend ONE credit on `account` because an operator named it — the manual
+   * path behind `teamclaude redeem <account>`.
+   *
+   * No policy decides this: the operator has already answered "is it worth
+   * spending, and on which account". What is kept is everything that makes the
+   * call itself safe — a fresh token, the account's idempotency key (so a retry
+   * after an unread answer replays the key and upstream answers
+   * `already_redeemed` instead of spending a second credit), and `_consume`'s
+   * own bookkeeping, which holds the AUTOMATIC path off afterwards. What is
+   * deliberately not applied is the fleet hold and the per-account cooldown as
+   * gates: they exist to stop a machine spending a second credit on a guess,
+   * and an operator redeeming several accounts in turn is not that. The rows
+   * are read fresh rather than from the six-hour cache, since "what does this
+   * account hold right now" is the question being asked.
+   *
+   * @param {Record<string, any>} account
+   * @returns {Promise<RedeemResult & {creditsLeft?: number}>}
+   */
+  async redeemOnRequest(account) {
+    if (providerOf(account) !== 'codex' || !account?.accountId) {
+      return { redeemed: false, reason: 'not a Codex OAuth account' };
+    }
+    const now = this.now();
+    // Longer than the automatic path's budget: nobody is waiting on a refused
+    // request here, and a manual call that gives up at ten seconds only trains
+    // the operator to re-run it.
+    const deadline = now + Math.max(this.timeoutMs, 30_000);
+    const state = this._stateFor(account);
+    state.credits = null;
+    const read = await this._credits(account, state, now, deadline);
+    if (read.error) return { redeemed: false, reason: `could not read reset credits (${read.error})` };
+    const rows = read.credits || [];
+    const credit = redeemableCredit(rows);
+    if (!credit) return { redeemed: false, reason: 'holds no redeemable reset credit', creditsLeft: 0 };
+    const held = rows.filter(row => row.status === 'available' && row.supportedByPlan !== false).length;
+    const result = await this._consume(account, state,
+      { redeem: true, reason: 'requested by an operator', creditId: credit.id }, now, deadline);
+    return { ...result, creditsLeft: result.redeemed ? Math.max(0, held - 1) : held };
+  }
+
+  /**
    * @param {object} account
    * @returns {RedeemState}
    */
