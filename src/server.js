@@ -409,13 +409,15 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
-// Control-plane writes that change the config file, with the refusal a
-// caller holding a client key (rather than the operator's proxy.apiKey) gets.
-// See the check in createProxyServer for why a tenant may not reach these.
+// Control-plane writes that change the config file, or touch the fleet's
+// credentials, with the refusal a caller holding a client key (rather than
+// the operator's proxy.apiKey) gets. See the check in createProxyServer for
+// why a tenant may not reach these.
 const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
+  ['/teamclaude/relogin-check', 'a client key cannot refresh credentials'],
 ]);
 
 /**
@@ -733,6 +735,30 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.error('[TeamClaude] Quota probe failed:', err.message);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'quota probe failed; see the proxy log' }));
+        }
+        return;
+      }
+
+      // On-demand re-login check — every OAuth refresh token verified now,
+      // not only those due within the hour (AccountManager.reloginCheck): the
+      // headless equivalent of the TUI's `v` key, and what `teamclaude
+      // relogin-check` calls. Upstream calls, but only to the token endpoints,
+      // with credentials the server already holds; a client key is refused
+      // above (CLIENT_KEY_REFUSED_PATHS). Answers with the outcome per account.
+      if (req.method === 'POST' && req.url === '/teamclaude/relogin-check') {
+        if (typeof accountManager.reloginCheck !== 'function') {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'relogin check not supported' }));
+          return;
+        }
+        try {
+          const result = await accountManager.reloginCheck({ withinMs: Infinity });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          console.error('[TeamClaude] Re-login check failed:', err.message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'relogin check failed; see the proxy log' }));
         }
         return;
       }

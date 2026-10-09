@@ -1243,6 +1243,10 @@ export class TUI {
       this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex; this.selReturn = 'normal';
     }
     else if (k === 'p' && this.am.accounts.length > 0) { this._doProbe(); }
+    // On-demand re-login check: verify every OAuth refresh token now, not only
+    // the ones the hourly look-ahead would, and say which accounts need a
+    // sign-in. The same pass as `teamclaude relogin-check`.
+    else if (k === 'v' && this.am.accounts.length > 0) { this._doReloginCheck(); }
     // Re-login: an OAuth account whose refresh token upstream has rejected stays
     // in 'error' until someone signs in again, and that someone is usually
     // looking at this screen. The cursor starts on the first account that needs
@@ -1808,6 +1812,29 @@ export class TUI {
       this._addLog(`Quota refresh failed: ${e.message}`);
     } finally {
       this._probing = false;
+    }
+  }
+
+  // On-demand re-login check (the `v` key): verify every OAuth account's
+  // refresh token now — not only the ones due within the hour, which is all
+  // the periodic check looks at — and name the accounts that need a sign-in.
+  // The same pass `teamclaude relogin-check` and POST /teamclaude/relogin-check
+  // run; the manager marks a dead one exactly as a request would have, so the
+  // rows turn `relogin` as it goes. Attach mode has no manager to run it on.
+  async _doReloginCheck() {
+    if (typeof this.am.reloginCheck !== 'function') { this._addLog('Re-login check unavailable'); return; }
+    if (this._reloginChecking) return; // one pass at a time
+    this._reloginChecking = true;
+    this._addLog('Verifying every OAuth refresh token...');
+    try {
+      const r = await this.am.reloginCheck({ withinMs: Infinity });
+      const who = r.accounts.filter((/** @type {any} */ a) => a.outcome === 'relogin').map((/** @type {any} */ a) => `"${a.name}"`).join(', ');
+      this._addLog(`Re-login check: ${r.refreshed} refreshed, ${r.relogin} need${r.relogin === 1 ? 's' : ''} re-login${who ? ` (${who})` : ''}, ${r.failed} failed, ${r.skipped} skipped`);
+    } catch (/** @type {any} */ e) {
+      this._addLog(`Re-login check failed: ${e?.message || e}`);
+    } finally {
+      this._reloginChecking = false;
+      if (this.running) this.render();
     }
   }
 
@@ -3699,7 +3726,7 @@ export class TUI {
       case 'normal':
         return this.remote
           ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
-          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${bold('p')}robe quota  ${bold('v')}erify tokens  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':

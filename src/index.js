@@ -41,7 +41,7 @@ import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
-import { renderStatus, formatPercent } from './status-renderer.js';
+import { renderStatus, renderReloginCheck, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
@@ -250,6 +250,10 @@ switch (command) {
     await probeCommand();
     process.exit(0);
     break;
+  case 'relogin-check':
+    await reloginCheckCommand();
+    process.exit(0);
+    break;
   case 'warmup':
     await warmupCommand();
     process.exit(0);
@@ -382,7 +386,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, reloginCheckWindowMs: config.reloginCheckWindowMs, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -645,6 +649,9 @@ async function serverCommand() {
       config.reloginCheck = diskConfig.reloginCheck !== false;
       prober.reloginCheck = config.reloginCheck;
     }
+    // How far ahead that check looks; read at the start of each pass too.
+    config.reloginCheckWindowMs = diskConfig.reloginCheckWindowMs;
+    accountManager.setReloginCheckWindow(diskConfig.reloginCheckWindowMs);
     if (warmer) {
       const diskSchedule = diskConfig.warmupSchedule || null;
       const ms = (diskConfig.warmupSeconds || 0) * 1000;
@@ -2163,6 +2170,49 @@ async function probeCommand() {
   await notifyRunningServer(config);
 }
 
+// ── relogin-check ───────────────────────────────────────────
+
+// `teamclaude relogin-check` — have the running server verify every OAuth
+// account's refresh token now (POST /teamclaude/relogin-check, the same pass
+// as the TUI's `v` key) and print what became of each account. The periodic
+// check only looks at tokens about to expire; this is the operator asking
+// about all of them, typically after a `/login` somewhere else.
+async function reloginCheckCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const json = args.includes('--json');
+  const colorArg = argValue('--color') || args.find(arg => arg.startsWith('--color='))?.slice('--color='.length);
+  const color = colorArg === 'always' || (colorArg !== 'never' && process.stdout.isTTY);
+  let res, data;
+  try {
+    // A refresh is retried on a transient failure with a 30 s budget per try,
+    // so this waits well beyond what `status` allows.
+    res = await fetch(`http://localhost:${port}/teamclaude/relogin-check`, {
+      method: 'POST',
+      headers: { 'x-api-key': config.proxy.apiKey },
+      signal: AbortSignal.timeout(Number(envVar('RELOGIN_CHECK_TIMEOUT_MS')) || 180_000),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch {
+    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error('Is the server running? Start with: teamclaude server');
+    process.exit(1);
+  }
+  if (!res.ok) {
+    // Our own errors are strings; a server too old to know this endpoint
+    // forwards the request upstream, and that answer is an object.
+    const detail = typeof data.error === 'string' ? data.error : null;
+    console.error(detail || `Re-login check failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+    if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+    process.exit(1);
+  }
+  if (json) {
+    await writeStdout(`${JSON.stringify(data, null, 2)}\n`);
+    return;
+  }
+  await writeStdout(`${renderReloginCheck(data, { color })}\n`);
+}
+
 // ── warmup ──────────────────────────────────────────────────
 
 async function warmupCommand() {
@@ -2793,6 +2843,8 @@ Commands:
                       the fewest requests in the last ten minutes
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
+  relogin-check       Verify every OAuth account's refresh token on the running
+                      server now and list which need a sign-in (--json)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
                       a minimal claude request to each (spends a little quota)
   warmup reset HH:MM --timezone Area/City

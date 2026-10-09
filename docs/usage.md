@@ -69,6 +69,12 @@ Headless, you can re-sync accounts from the config without a restart by POSTing 
 curl -X POST http://localhost:3456/teamclaude/reload
 ```
 
+The on-demand [re-login check](accounts.md#knowing-before-a-request-fails-relogin) has one too (the equivalent of **v** in the TUI, and what `teamclaude relogin-check` calls): it verifies every OAuth refresh token now and answers with the outcome per account. It refreshes the fleet's credentials, so a client key is refused:
+
+```bash
+curl -X POST http://localhost:3456/teamclaude/relogin-check
+```
+
 The switch threshold has a control endpoint of its own — the same change as `teamclaude threshold 90`, and what the browser dashboard's **Switch at** control sends:
 
 ```bash
@@ -119,6 +125,7 @@ curl -X POST http://localhost:3456/teamclaude/priority \
 | `d` | Enable/disable an account |
 | `l` | Sign an account in again (opens on the first account in `error`; not in attach mode). A panel shows the sign-in link, clickable and copied to the clipboard, and takes the pasted answer back, so it works over SSH — see [Signing in again from the TUI](accounts.md#signing-in-again-from-the-tui) |
 | `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
+| `v` | Verify every OAuth account's refresh token now — the on-demand [re-login check](accounts.md#knowing-before-a-request-fails-relogin); the activity pane says which accounts need a sign-in |
 | `R` | Reload accounts from config |
 | `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder/sort accounts, upstream and account proxies, sx.org) |
 | `q` | Quit |
@@ -211,6 +218,7 @@ teamclaude route list        # Manage per-model routes (add/rm)
 teamclaude threshold 90      # Utilization at which rotation leaves an account
 teamclaude distribute on     # Spread new sessions across equal-priority accounts
 teamclaude probe 300         # Enable background quota refresh (off by default)
+teamclaude relogin-check     # Verify every OAuth refresh token now; lists who needs a sign-in
 teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
 teamclaude warmup reset 15:30 --timezone Europe/Moscow
                              # Schedule warm-up for a daily target reset
@@ -234,7 +242,7 @@ teamclaude help              # Show all commands
 
 ## Control routes under a second name
 
-Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `priority`, `threshold`, `probe`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
+Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `priority`, `threshold`, `probe`, `relogin-check`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
 
 ## Status dashboard (browser)
 

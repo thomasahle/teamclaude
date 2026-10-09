@@ -168,6 +168,40 @@ export const UNAVAILABLE_TEXT = {
  * account that spent this month and has since been switched off is still a
  * fact about where the money went.
  */
+/**
+ * The table `teamclaude relogin-check` prints: one row per account with the
+ * outcome of the on-demand re-login check (AccountManager.reloginCheck) and
+ * its reason, then the counts. Pure over the endpoint's payload, which comes
+ * off the wire, so every string in it is cut down before it is printed.
+ * @param {{ scope?: string, withinMs?: number|null, checked?: number, refreshed?: number, relogin?: number, failed?: number, skipped?: number, accounts?: any[] }} result
+ * @param {{ color?: boolean }} [opts]
+ */
+export function renderReloginCheck(result, { color = process.stdout.isTTY } = {}) {
+  const paint = colors(color);
+  const rows = Array.isArray(result?.accounts) ? result.accounts : [];
+  const lines = [];
+  const scope = result?.scope === 'due' && result.withinMs
+    ? `tokens due within ${Math.round(Number(result.withinMs) / 60_000)} min`
+    : 'every OAuth refresh token';
+  const n = (/** @type {string} */ key) => Number(result?.[key]) || 0;
+  lines.push(paint.bold('Re-login check') + paint.dim(` (${scope}; ${rows.length} account${rows.length === 1 ? '' : 's'}, ${n('checked')} refreshed now)`));
+  const names = rows.map(r => nameText(r?.name));
+  const nameW = Math.min(40, Math.max(4, ...names.map(s => s.length)));
+  /** @type {Record<string, (s: string) => string>} */
+  const tint = { refreshed: paint.green, relogin: paint.red, failed: paint.yellow, skipped: paint.dim };
+  rows.forEach((r, i) => {
+    const outcome = safeLine(String(r?.outcome || '?'), 12);
+    const word = (tint[outcome] || ((/** @type {string} */ s) => s))(outcome.padEnd(9));
+    const reason = r?.reason ? paint.dim(safeLine(String(r.reason), 160)) : '';
+    lines.push(`  ${names[i].padEnd(nameW)}  ${word}  ${reason}`.trimEnd());
+  });
+  if (!rows.length) lines.push(paint.dim('  no accounts'));
+  const relogin = n('relogin');
+  lines.push(`${n('refreshed')} refreshed, ${relogin} need${relogin === 1 ? 's' : ''} re-login, ${n('failed')} failed, ${n('skipped')} skipped`);
+  if (relogin) lines.push(paint.red('Sign in again: teamclaude login (or `l` in the TUI)'));
+  return lines.join('\n');
+}
+
 export function spendLine(account, paint) {
   const spend = account?.quota?.spend;
   if (!spend) return null;

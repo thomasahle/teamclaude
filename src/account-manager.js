@@ -1,4 +1,4 @@
-import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, normalizeExpiresAt, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
@@ -109,6 +109,13 @@ export const RELOGIN_CHECK_WINDOW_MS = 60 * 60 * 1000;
  */
 export function needsRelogin(account) {
   return account?.type === 'oauth' && account?.status === 'error';
+}
+
+// "1h 30m" / "12m", for the re-login check's "not due" reason.
+function formatDue(ms) {
+  const minutes = Math.max(0, Math.round(ms / 60_000));
+  const h = Math.floor(minutes / 60), m = minutes % 60;
+  return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
 }
 
 // Codex model-scoped weekly buckets are keyed by slugs taken from response
@@ -475,6 +482,9 @@ function makeAccount(acct, index, listener = null) {
     // (post-401) refreshes so a burst of stale in-flight requests can't rotate
     // the refresh-token family once per request — see ensureTokenFresh.
     _lastRefreshAt: null,
+    // Why the last refresh did not land, when it did not (one line); null
+    // after one that did. Read by the re-login check's per-account report.
+    _lastRefreshError: /** @type {string|null} */ (null),
     // The refresh token upstream last rejected as invalid, if it is still the
     // one we hold — see the dead-token guard in ensureTokenFresh.
     _deadRefreshToken: null,
@@ -543,6 +553,7 @@ export class AccountManager {
    * @param {number} [opts.familyStaleMs]
    * @param {number} [opts.statusStaleMs]
    * @param {number} [opts.forcedRefreshFloorMs]
+   * @param {unknown} [opts.reloginCheckWindowMs]  how far ahead the re-login check looks (config `reloginCheckWindowMs`); anything but a positive number is the hour
    * @param {Array<Object>} [opts.routes]
    * @param {Object} [opts.ramp]
    * @param {boolean|string} [opts.distributeSessions]
@@ -552,7 +563,7 @@ export class AccountManager {
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, reloginCheckWindowMs, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -560,6 +571,8 @@ export class AccountManager {
     this._refreshFn = refreshFn;
     this._codexRefreshFn = codexRefreshFn;
     this._refreshCoordinator = refreshCoordinator;
+    // How far ahead the re-login check looks (config `reloginCheckWindowMs`).
+    this.setReloginCheckWindow(reloginCheckWindowMs);
     // Kept for accounts added at runtime, which go through the same guard.
     this.listener = listener;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index, listener));
@@ -4891,6 +4904,14 @@ export class AccountManager {
    * @param {number} accountIndex
    * @param {boolean} [force]
    * @param {{ expiringWithinMs?: number }} [opts]
+   * @returns {Promise<'ineligible'|'relogin'|'fresh'|'refreshed'|'kept'|'discarded'|'failed'>}
+   *   what became of it, for the re-login check's per-account report; every
+   *   other caller ignores it. `refreshed`: new tokens are in place. `relogin`:
+   *   the refresh token is dead (now, or already known to be) and the account
+   *   is marked. `failed`: a transient failure, the token is kept. `kept`: the
+   *   coordinator left the still-good token while another install renews it.
+   *   `discarded`: tokens arrived from elsewhere mid-refresh and won.
+   *   `fresh`: nothing to do. `ineligible`: not a token this manager refreshes.
    */
   async ensureTokenFresh(accountIndex, force = false, { expiringWithinMs = undefined } = {}) {
     const account = this.accounts[accountIndex];
@@ -4899,7 +4920,7 @@ export class AccountManager {
     // hand that credential to a party it was never issued for. The prober and
     // the warmer already draw this line; this is the third caller that reaches
     // a credential, and the one the send path and the 401 retry go through.
-    if (!account || account.type !== 'oauth' || !account.refreshToken || account.upstream) return;
+    if (!account || account.type !== 'oauth' || !account.refreshToken || account.upstream) return 'ineligible';
 
     // Dead-token guard: a refresh token upstream already rejected (invalid_grant)
     // will be rejected every time, so retrying it only floods the OAuth endpoint
@@ -4923,10 +4944,10 @@ export class AccountManager {
         this._needsLogin(account, 'refresh_rejected', 'its refresh token was already rejected');
         console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" still holds a rejected refresh token — run: teamclaude login`);
       }
-      return;
+      return 'relogin';
     }
 
-    if (!force && !isTokenExpiringSoon(account.expiresAt, expiringWithinMs)) return;
+    if (!force && !isTokenExpiringSoon(account.expiresAt, expiringWithinMs)) return 'fresh';
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
     // already in flight when the token went bad comes back rejected, and each
@@ -4940,7 +4961,7 @@ export class AccountManager {
     // reacting to a response and can't stampede.
     if (force && account._lastRefreshAt !== null
         && Date.now() - account._lastRefreshAt < this._forcedRefreshFloorMs) {
-      return;
+      return 'fresh';
     }
 
     // Coalesce concurrent refreshes
@@ -4979,10 +5000,10 @@ export class AccountManager {
           return tokens;
         };
         const newTokens = await this._refreshCoordinator(account, refresh, { force });
-        if (newTokens == null) return;
+        if (newTokens == null) return 'kept';
         if (account.refreshToken !== sent) {
           console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
-          return;
+          return 'discarded';
         }
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
@@ -4991,10 +5012,13 @@ export class AccountManager {
         account._deadRefreshToken = null; // this token works; clear any stale guard
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
+        account._lastRefreshError = null;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
+        return 'refreshed';
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
+        account._lastRefreshError = safeLine(err?.message || String(err), 200);
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
         // way, so hold the account out of rotation now rather than after it.
@@ -5015,12 +5039,14 @@ export class AccountManager {
           account._deadRefreshToken = sent;
           if (account.refreshToken !== sent) {
             console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
-            return;
+            return 'discarded';
           }
           this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
           console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
           this._onAccountError?.(account);
+          return 'relogin';
         }
+        return 'failed';
       } finally {
         account._refreshPromise = null;
       }
@@ -5051,22 +5077,124 @@ export class AccountManager {
    * decline the refresh, and an `error` from an access-token rejection is not
    * something another refresh repairs. Every refresh runs at once; a slow one
    * does not hold the rest. Resolves with the accounts that were refreshed.
+   * The per-account answer is reloginCheck's, over the same pass.
    *
-   * @param {{ withinMs?: number }} [opts]
+   * @param {{ withinMs?: number }} [opts]  default: the configured window
    * @returns {Promise<Record<string, any>[]>}
    */
-  async refreshExpiringTokens({ withinMs = RELOGIN_CHECK_WINDOW_MS } = {}) {
-    const due = this.accounts.filter(account => account.type === 'oauth'
-      && !!account.refreshToken && !account.upstream && !account.disabled
-      && account.status !== 'error'
-      && isTokenExpiringSoon(account.expiresAt, withinMs));
-    if (!due.length) return due;
-    const minutes = Math.round(withinMs / 60_000);
-    console.log(`[TeamClaude] Refreshing ${due.length} OAuth token(s) due within ${minutes} min, so a rejected one is reported before a request fails on it`);
-    // ensureTokenFresh reports its own failures and never rejects; the catch is
-    // for a refresh coordinator that does.
-    await Promise.all(due.map(account => this.ensureTokenFresh(account.index, false, { expiringWithinMs: withinMs }).catch(() => {})));
-    return due;
+  async refreshExpiringTokens({ withinMs = this.reloginCheckWindowMs } = {}) {
+    const { plan } = await this._runReloginCheck(withinMs);
+    return plan.filter(p => !p.before).map(p => p.account);
+  }
+
+  /**
+   * The one-hour look-ahead of the re-login check, or the operator's own
+   * (config `reloginCheckWindowMs`): a positive number of milliseconds is
+   * taken, anything else means the default. Returns what was set.
+   * @param {unknown} ms
+   */
+  setReloginCheckWindow(ms) {
+    const n = Number(ms);
+    this.reloginCheckWindowMs = Number.isFinite(n) && n > 0 ? n : RELOGIN_CHECK_WINDOW_MS;
+    return this.reloginCheckWindowMs;
+  }
+
+  /**
+   * The re-login check with its answer per account, for an operator asking
+   * on demand: `teamclaude relogin-check`, the TUI's `v` key and
+   * POST /teamclaude/relogin-check all run this with `withinMs: Infinity`,
+   * which verifies every refresh token now, a known expiry or not, instead
+   * of only the ones due within the window. Each account reports one of
+   * `refreshed`, `relogin` (the refresh token is dead, or was already known
+   * to be), `failed` (a transient failure; the token is kept) or `skipped`,
+   * with a reason, and the counts are summed. Same pass and same marking as
+   * refreshExpiringTokens: ensureTokenFresh does all of it.
+   *
+   * @param {{ withinMs?: number }} [opts]  default: the configured window
+   * @returns {Promise<{ scope: 'all'|'due', withinMs: number|null, checked: number, refreshed: number, relogin: number, failed: number, skipped: number, accounts: { name: string, provider: string, outcome: string, reason: string|null }[] }>}
+   */
+  async reloginCheck({ withinMs = this.reloginCheckWindowMs } = {}) {
+    const { all, window, plan } = await this._runReloginCheck(withinMs);
+    const accounts = plan.map(({ account, before, after }) => ({
+      name: account.name, provider: providerOf(account), ...(before || after),
+    }));
+    const count = (/** @type {string} */ outcome) => accounts.filter(r => r.outcome === outcome).length;
+    return {
+      scope: all ? 'all' : 'due', withinMs: all ? null : window, checked: plan.filter(p => !p.before).length,
+      refreshed: count('refreshed'), relogin: count('relogin'), failed: count('failed'), skipped: count('skipped'),
+      accounts,
+    };
+  }
+
+  /**
+   * One pass of the check: decide per account, refresh the ones that are
+   * due, all at once, and read each refresh's outcome off ensureTokenFresh.
+   * `withinMs` of Infinity (or anything not below it) is the on-demand form:
+   * the refresh is forced, since expiry is not the question being asked.
+   * @param {number} withinMs
+   */
+  async _runReloginCheck(withinMs) {
+    const all = !(withinMs < Infinity);
+    const window = all ? Infinity : withinMs;
+    const plan = this.accounts.map(account => ({
+      account,
+      before: this._reloginCheckBefore(account, window),
+      after: /** @type {{ outcome: string, reason: string|null }|null} */ (null),
+    }));
+    const due = plan.filter(p => !p.before);
+    if (due.length) {
+      console.log(`[TeamClaude] Refreshing ${due.length} OAuth token(s) ${all ? 'on request' : `due within ${Math.round(window / 60_000)} min`}, so a rejected one is reported before a request fails on it`);
+    }
+    // ensureTokenFresh reports its own failures and never rejects; the catch
+    // is for a refresh coordinator that does.
+    const results = await Promise.all(due.map(p => this.ensureTokenFresh(p.account.index, all, { expiringWithinMs: window })
+      .catch(err => { p.account._lastRefreshError = safeLine(err?.message || String(err), 200); return 'failed'; })));
+    due.forEach((p, i) => { p.after = this._reloginCheckAfter(p.account, results[i]); });
+    return { all, window, plan };
+  }
+
+  /**
+   * What the check says about an account it will not refresh, or null for
+   * one it will. The accounts left alone are the ones the on-use path would
+   * never refresh either: not OAuth, a third-party credential, no refresh
+   * token, disabled. One already in `error` is reported as needing the
+   * re-login it needs rather than retried — the dead-token guard would
+   * decline, and an `error` from an access-token rejection is not something
+   * another refresh repairs. Under a window, a token not yet due is skipped
+   * and says when it is.
+   * @param {Record<string, any>} account
+   * @param {number} withinMs
+   * @returns {{ outcome: string, reason: string|null }|null}
+   */
+  _reloginCheckBefore(account, withinMs) {
+    if (account.type !== 'oauth') return { outcome: 'skipped', reason: 'not an OAuth account' };
+    if (account.upstream) return { outcome: 'skipped', reason: 'a third-party credential, not refreshed here' };
+    if (!account.refreshToken) return { outcome: 'skipped', reason: 'no refresh token' };
+    if (account.disabled) return { outcome: 'skipped', reason: 'disabled' };
+    if (account.status === 'error') return { outcome: 'relogin', reason: 'already marked, not retried — sign in again (teamclaude login)' };
+    if (withinMs < Infinity && !isTokenExpiringSoon(account.expiresAt, withinMs)) {
+      const at = normalizeExpiresAt(account.expiresAt);
+      return { outcome: 'skipped', reason: at ? `not due: the token expires in ${formatDue(at - Date.now())}` : 'not due: no expiry known' };
+    }
+    return null;
+  }
+
+  /**
+   * The row for an account the check refreshed, from ensureTokenFresh's answer.
+   * @param {Record<string, any>} account
+   * @param {string} result
+   * @returns {{ outcome: string, reason: string|null }}
+   */
+  _reloginCheckAfter(account, result) {
+    switch (result) {
+      case 'refreshed': return { outcome: 'refreshed', reason: null };
+      case 'relogin': return { outcome: 'relogin', reason: 'refresh token rejected — sign in again (teamclaude login)' };
+      case 'failed': return { outcome: 'failed', reason: `refresh failed, token kept: ${account._lastRefreshError || 'see the server log'}` };
+      case 'kept': return { outcome: 'skipped', reason: 'another install is renewing its token' };
+      case 'discarded': return { outcome: 'skipped', reason: 'its tokens were replaced while the refresh was in flight' };
+      case 'fresh': return { outcome: 'skipped', reason: 'refreshed moments ago' };
+      default: return { outcome: 'skipped', reason: 'not refreshable' };
+    }
   }
 
   /**

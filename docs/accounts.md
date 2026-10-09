@@ -290,7 +290,9 @@ A rotated-away refresh token is only discovered when it is used, and it is used 
 
 So the server looks ahead. At startup, and at the start of every [quota-probe](quota.md#quota-probe) pass, every OAuth account (Claude or Codex) whose access token has expired or expires within the hour has it refreshed in the background. That is the same refresh the next request would have made, only earlier: a refresh token upstream rejects marks the account `relogin` exactly as it would have on use — the row in the TUI, the account in `teamclaude status`, and `needsRelogin: true` on it in `/teamclaude/status` all say so, and the `l` key opens on it. A transient failure (network, a 5xx) changes nothing: the account keeps its token and is tried again on the next pass or the next request. An account that is disabled, already in `relogin`, or carries a third-party credential is left alone, as it is on use.
 
-With the probe off (the default) the check runs at startup only; `teamclaude probe <seconds>` makes it periodic. `reloginCheck: false` in the config turns it off altogether.
+With the probe off (the default) the check runs at startup only; `teamclaude probe <seconds>` makes it periodic. `reloginCheck: false` in the config turns it off altogether, and `reloginCheckWindowMs` sets how far ahead it looks (the hour).
+
+To ask about every account now — after a `/login` somewhere else, say — run `teamclaude relogin-check`, press **`v`** in the TUI, or `POST /teamclaude/relogin-check`. That verifies every OAuth refresh token the server holds, a known expiry or not, and reports each account as `refreshed`, `relogin` (the token is dead, or was already known to be), `failed` (a transient failure; the token is kept and tried again later) or `skipped`, with the reason. The CLI prints the table (`--json` for the payload); the TUI logs the counts and names who needs a sign-in; the endpoint answers with the same payload, and refuses a client key, since it refreshes the fleet's credentials.
 
 ## The `id` field
 
