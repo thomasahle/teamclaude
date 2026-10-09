@@ -1,6 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, normalizeExpiresAt, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
+import { BurnTracker } from './burn.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
@@ -554,6 +555,7 @@ export class AccountManager {
    * @param {number} [opts.statusStaleMs]
    * @param {number} [opts.forcedRefreshFloorMs]
    * @param {unknown} [opts.reloginCheckWindowMs]  how far ahead the re-login check looks (config `reloginCheckWindowMs`); anything but a positive number is the hour
+   * @param {import('./burn.js').BurnTracker|null} [opts.burn]  the burn-per-hour history (burn.js); memory-only when absent
    * @param {Array<Object>} [opts.routes]
    * @param {Object} [opts.ramp]
    * @param {boolean|string} [opts.distributeSessions]
@@ -563,7 +565,7 @@ export class AccountManager {
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, reloginCheckWindowMs, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, reloginCheckWindowMs, burn = null, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -573,6 +575,10 @@ export class AccountManager {
     this._refreshCoordinator = refreshCoordinator;
     // How far ahead the re-login check looks (config `reloginCheckWindowMs`).
     this.setReloginCheckWindow(reloginCheckWindowMs);
+    // The history behind the burn-per-hour readout (burn.js). The server
+    // hands in one backed by the log file beside the config; memory-only
+    // otherwise, which is what a test or an embedder gets.
+    this.burn = burn || new BurnTracker();
     // Kept for accounts added at runtime, which go through the same guard.
     this.listener = listener;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index, listener));
@@ -4263,6 +4269,7 @@ export class AccountManager {
 
     this._observeBurnRate(account, observed);
     this._observeOutsideSpend(account, observed);
+    this._sampleBurn(account);
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -4390,6 +4397,7 @@ export class AccountManager {
 
     this._observeBurnRate(account, observed);
     this._observeOutsideSpend(account, observed, { familyResets: false });
+    this._sampleBurn(account);
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -4586,6 +4594,37 @@ export class AccountManager {
   }
 
   /**
+   * Hand the burn history one reading of an account: every window's level
+   * as the quota record now holds it, and the token counters as they stand.
+   * Called wherever a reading lands — the two header paths and the two probe
+   * paths — beside _observeBurnRate. A probe result always becomes a sample;
+   * a header reading only once a minute per account (burn.js), so a busy
+   * account does not write a line per request. The dedicated family fields
+   * (unified7dFable, unified7dSonnet) stand in for a scoped bucket the
+   * payload did not list, so a family read off headers alone is tracked too.
+   * @param {Record<string, any>} account
+   * @param {{ probe?: boolean }} [opts]
+   */
+  _sampleBurn(account, { probe = false } = {}) {
+    if (!account) return;
+    const q = account.quota;
+    /** @type {Record<string, unknown>} */
+    const scopedWeekly = {};
+    for (const [family, bucket] of Object.entries(q.scopedWeekly || {})) scopedWeekly[family] = bucket?.utilization;
+    if (scopedWeekly.fable == null && q.unified7dFable != null) scopedWeekly.fable = q.unified7dFable;
+    if (scopedWeekly.sonnet == null && q.unified7dSonnet != null) scopedWeekly.sonnet = q.unified7dSonnet;
+    this.burn.record(account.name, {
+      unified5h: q.unified5h, unified7d: q.unified7d, scopedWeekly,
+      inputTokens: account.usage.totalInputTokens, outputTokens: account.usage.totalOutputTokens,
+    }, { force: probe });
+  }
+
+  /** The `burn` block of the status payload (burn.js): rates per provider and per account. */
+  burnStatus(now = this.burn.now()) {
+    return this.burn.status(this.accounts, now);
+  }
+
+  /**
    * Update cumulative token usage from response body data.
    */
   updateUsage(accountIndex, inputTokens, outputTokens) {
@@ -4740,6 +4779,7 @@ export class AccountManager {
     // Feed only the windows actually present in this payload.
     this._observeBurnRate(account, observed);
     this._observeOutsideSpend(account, observed);
+    this._sampleBurn(account, { probe: true });
 
     // Banked usage-limit resets (issue #493), stamped exactly as the Codex
     // path stamps its reset credits: a payload with no usable reset block
@@ -4825,6 +4865,7 @@ export class AccountManager {
       account.probing = false;
       account.requalify = true;
     }
+    this._sampleBurn(account, { probe: true });
   }
 
   /** Apply subscription metadata learned from the OAuth profile endpoint. */
@@ -5494,6 +5535,9 @@ export class AccountManager {
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
+      // Burn per hour, per provider and per account (burn.js): the slope of
+      // the windows the rows below show the level of.
+      burn: this.burnStatus(),
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,

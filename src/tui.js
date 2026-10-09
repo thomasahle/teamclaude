@@ -13,6 +13,7 @@ import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './pro
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits, showSessionRow } from './status-renderer.js';
 import { needsRelogin } from './account-manager.js';
+import { burnSummaryLines } from './burn.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
@@ -1932,6 +1933,19 @@ export class TUI {
   }
 
   /**
+   * Burn per hour, one row per provider, drawn under the header (burn.js):
+   * the slope of the windows the account rows show the level of. Live, the
+   * manager computes it; attached, it is the server's own block. A provider
+   * with fewer than two readings has no row yet, and a pool that runs out
+   * before its reset is drawn in red.
+   * @returns {string[]}
+   */
+  _burnLines() {
+    const burn = typeof this.am.burnStatus === 'function' ? this.am.burnStatus() : null;
+    return burnSummaryLines(burn, Date.now()).map(({ text, critical }) => ` ${gray('burn')}  ${critical ? red(text) : text}`);
+  }
+
+  /**
    * A control sequence for the terminal itself rather than for the frame: a
    * mode switch or a clipboard write. Through the same stdout the frame is
    * painted on, and under the same rule: nothing once the terminal is gone.
@@ -2582,6 +2596,9 @@ export class TUI {
     } else if (view === 'blocklist') {
       this._renderBlocklist(lines);
     } else {
+    // ── Burn per hour, one row per provider, under the header (see _burnLines).
+    for (const row of this._burnLines()) lines.push(row);
+
     // ── Accounts, or the login panel in their place. The activity pane stays
     // under the panel: the sign-in's own progress lines land there.
     if (view === 'login') {

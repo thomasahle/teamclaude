@@ -138,6 +138,21 @@ The settings screen is a list, not a set of letter shortcuts: `↑`/`↓` move b
 
 **Sort accounts** chooses what orders the list inside each provider group: **arranged** (your order, above), or the soonest reset of one window — **session reset** (five-hour), **weekly reset**, **S7 reset** or **F7 reset** — which puts the account whose window ends soonest at the top: the quota you lose first if nothing spends it. S7 and F7 read the all-models weekly on an account that has no Sonnet or Fable bucket of its own, since that is the window its Sonnet or Fable use counts against. Accounts with no reading for the window go last (for the session sort, that includes every account with no five-hour window open), and your arrangement breaks ties. A third-party backend sorts by its probed windows, with the monthly one standing in for a weekly reset the plan does not have. The reorder screen always shows the arranged order, because that is the order it edits. `teamclaude attach` reads the same `accountSort` from its own config file.
 
+### Burn per hour
+
+How fast the fleet is spending, not only how much it has spent. Under the header the TUI draws one line per provider:
+
+```
+burn  anthropic  5h 11%/h  wk 1.9%/h  tok 1.2M in/300k out per h  wk pool 52h (reset 3d 2h)
+burn  codex      5h 4.0%/h  wk 0.8%/h  wk pool 6.1d (reset 4d 20h)
+```
+
+`5h` and `wk` are how much of one account's five-hour and weekly window the provider's accounts spend per hour, summed over the accounts, measured over the last hour; `tok` is tokens per hour from the proxy's own counters. `wk pool` is how long the pool's remaining weekly capacity lasts at that rate — the sum over the accounts rotation can reach (not disabled, not waiting on a sign-in) of what each has left — and when the first of those accounts resets. A line turns red, and says `runs out before reset`, when the pool empties before that; the five-hour pool is added to the line when it is the one running out. `teamclaude status` prints the same lines (`Burn`), and `teamclaude burn` prints them with a per-account table underneath — each cell the rate over the last hour and over the last day — or the whole block as JSON with `--json`.
+
+The figures come from readings the server already takes: every quota probe result and, at most once a minute per account, the quota headers on responses. Each becomes a sample (the levels of every window, and the token counters) kept for 48 hours in memory and in `teamclaude.burn.jsonl` beside the config, one line per sample, so a restart keeps the history; the file is compacted to the retained samples on load. A rate is the rise of a window per hour of the time the samples span; a drop is a reset, which starts a new segment rather than counting as negative spend, and a window with fewer than two readings has no rate yet. With the probe off, readings arrive only with traffic, so an idle fleet shows the last rate it measured until the samples age out of the hour.
+
+`/teamclaude/status` carries the block as `burn`: `byProvider.<provider>.windows.{unified5h,unified7d,scopedWeekly.<bucket>}` with `perHour1h`, `perHour24h`, `pooledRemaining` (in windows), `pooledPctPerHour1h`, `exhaustHours1h`, `earliestReset` (ms epoch) and `runsOutBeforeReset`; `byProvider.<provider>.tokens` with `inPerHour1h`, `outPerHour1h`, `inPerHour24h`, `outPerHour24h`; and `byAccount.<name>` in the same shape without the pooled fields, plus `samples` and `sampledAt`. Every figure is `null` where there are not two readings to measure between. `sampledAt` at the top is the newest sample's time.
+
 ## Run Claude Code through the proxy
 
 ```bash
@@ -205,6 +220,7 @@ teamclaude env               # Print export lines for routing claude yourself
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude burn              # Burn per hour, per provider and per account (needs server; --json)
 teamclaude attach            # Open the live dashboard against a running server
 teamclaude dashboard         # Open the web dashboard in the browser (needs server)
 teamclaude service install   # Run the proxy as a login service (uninstall/status/print)

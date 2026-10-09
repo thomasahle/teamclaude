@@ -31,6 +31,16 @@ export function getStatePath() {
 }
 
 /**
+ * Path to the burn log (a sibling of the config): the quota readings behind
+ * the burn-per-hour figures (burn.js), one JSON line per sample, appended as
+ * they land and compacted on load.
+ */
+export function getBurnLogPath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.burn.jsonl') : cfg + '.burn.jsonl';
+}
+
+/**
  * Path to the crash log (a sibling of the config), where a fatal error is
  * recorded before the process exits.
  */

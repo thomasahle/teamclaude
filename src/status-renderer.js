@@ -4,6 +4,7 @@ import { safeLine } from './safe-text.js';
 import { ROUTE_COLORS } from './config-ops.js';
 import { describeRouting } from './account-routing.js';
 import { needsRelogin } from './account-manager.js';
+import { burnSummaryLines, formatRatePct, formatTokens } from './burn.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -49,6 +50,11 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   }
   if (status.server?.startedAt || status.server?.uptimeSeconds != null) {
     lines.push(`${paint.dim('Server'.padEnd(12))} ${formatServerSummary(status.server, now)}`);
+  }
+  // Burn per hour, one row per provider: the same lines the TUI draws under
+  // its header (burn.js). Red when a pool runs out before its reset.
+  for (const { text, critical } of burnSummaryLines(status.burn, now)) {
+    lines.push(`${paint.dim('Burn'.padEnd(12))} ${critical ? paint.red(text) : text}`);
   }
   lines.push('');
 
@@ -168,6 +174,48 @@ export const UNAVAILABLE_TEXT = {
  * account that spent this month and has since been switched off is still a
  * fact about where the money went.
  */
+/**
+ * What `teamclaude burn` prints: the provider lines the dashboards show, then
+ * one row per account with each rate over the last hour and the last day.
+ * Pure over the status payload's `burn` block, which comes off the wire, so
+ * every string in it is cut down before it is printed.
+ * @param {any} burn
+ * @param {{ color?: boolean, now?: number }} [opts]
+ */
+export function renderBurn(burn, { color = process.stdout.isTTY, now = Date.now() } = {}) {
+  const paint = colors(color);
+  const lines = [];
+  const sampledAt = parseTs(burn?.sampledAt);
+  lines.push(paint.bold('Burn per hour') + paint.dim(sampledAt
+    ? ` (last reading ${formatDuration(now - sampledAt)} ago; each figure: last 1 h / last 24 h)`
+    : ' (no readings yet)'));
+  const summary = burnSummaryLines(burn, now);
+  for (const { text, critical } of summary) lines.push(`  ${critical ? paint.red(text) : text}`);
+  if (!summary.length) {
+    lines.push(paint.dim('  no rate yet: two readings of a window are needed (a probe pass, or traffic)'));
+  }
+  const rows = Object.entries(burn?.byAccount && typeof burn.byAccount === 'object' ? burn.byAccount : {});
+  if (rows.length) {
+    lines.push('');
+    const names = rows.map(([name]) => nameText(name));
+    const nameW = Math.min(40, Math.max(7, ...names.map(s => s.length)));
+    const cell = (/** @type {string} */ a, /** @type {string} */ b) => `${a} / ${b}`;
+    lines.push(paint.dim(`  ${'Account'.padEnd(nameW)}  ${'Provider'.padEnd(9)}  ${'5h %/h'.padEnd(13)}  ${'wk %/h'.padEnd(13)}  ${'in tok/h'.padEnd(15)}  out tok/h`));
+    rows.forEach(([, a], i) => {
+      const w5 = a?.windows?.unified5h, w7 = a?.windows?.unified7d, t = a?.tokens;
+      lines.push([
+        `  ${names[i].padEnd(nameW)}`,
+        safeLine(String(a?.provider || '?'), 9).padEnd(9),
+        cell(formatRatePct(w5?.perHour1h), formatRatePct(w5?.perHour24h)).padEnd(13),
+        cell(formatRatePct(w7?.perHour1h), formatRatePct(w7?.perHour24h)).padEnd(13),
+        cell(formatTokens(t?.inPerHour1h), formatTokens(t?.inPerHour24h)).padEnd(15),
+        cell(formatTokens(t?.outPerHour1h), formatTokens(t?.outPerHour24h)),
+      ].join('  ').trimEnd());
+    });
+  }
+  return lines.join('\n');
+}
+
 /**
  * The table `teamclaude relogin-check` prints: one row per account with the
  * outcome of the on-demand re-login check (AccountManager.reloginCheck) and

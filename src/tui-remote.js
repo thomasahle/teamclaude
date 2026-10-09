@@ -315,9 +315,18 @@ export class RemoteAccountManager {
     // both leaves the label empty and the header simply omits it.
     this.versionLabel = text(status?.server?.versionLabel ?? status?.server?.version, LABEL_MAX);
     this.updateAvailable = !!status?.server?.updateAvailable;
+    // The burn-per-hour block as the server computed it (burn.js); the
+    // renderer cuts its names down and formats its numbers itself. Null from
+    // a server too old to send one, and the header line is simply absent.
+    this.burn = status?.burn && typeof status.burn === 'object' && !Array.isArray(status.burn) ? status.burn : null;
     this.status = status;
     this.connected = true;
     this.lastError = null;
+  }
+
+  /** The server's burn block, for the same header lines the server's own TUI draws. */
+  burnStatus() {
+    return this.burn ?? null;
   }
 
   markDisconnected(err) {

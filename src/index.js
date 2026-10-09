@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getBurnLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -24,6 +24,7 @@ import {
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
+import { BurnTracker } from './burn.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
@@ -41,7 +42,7 @@ import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
-import { renderStatus, renderReloginCheck, formatPercent } from './status-renderer.js';
+import { renderStatus, renderReloginCheck, renderBurn, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
@@ -254,6 +255,10 @@ switch (command) {
     await reloginCheckCommand();
     process.exit(0);
     break;
+  case 'burn':
+    await burnCommand();
+    process.exit(0);
+    break;
   case 'warmup':
     await warmupCommand();
     process.exit(0);
@@ -386,7 +391,12 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, reloginCheckWindowMs: config.reloginCheckWindowMs, listener: localListener(config) });
+  // Burn per hour (burn.js): the quota readings behind the rates the
+  // dashboards show, kept in a log beside the config so a restart keeps the
+  // last two days of them. A log that cannot be read is an empty history.
+  const burn = new BurnTracker({ path: getBurnLogPath() });
+  await burn.load().catch(err => console.error(`[TeamClaude] Could not read the burn log: ${err.message}`));
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, reloginCheckWindowMs: config.reloginCheckWindowMs, burn, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -2170,6 +2180,44 @@ async function probeCommand() {
   await notifyRunningServer(config);
 }
 
+// ── burn ────────────────────────────────────────────────────
+
+// `teamclaude burn` — burn per hour, per provider and per account, from the
+// running server's `burn` block in /teamclaude/status (burn.js): the same
+// provider lines the TUI and `status` show, then the per-account table.
+async function burnCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const json = args.includes('--json');
+  const colorArg = argValue('--color') || args.find(arg => arg.startsWith('--color='))?.slice('--color='.length);
+  const color = colorArg === 'always' || (colorArg !== 'never' && process.stdout.isTTY);
+  let data;
+  try {
+    const res = await fetch(`http://localhost:${port}/teamclaude/status`, {
+      headers: { 'x-api-key': config.proxy.apiKey },
+      signal: AbortSignal.timeout(Number(envVar('STATUS_TIMEOUT_MS')) || 5_000),
+    });
+    data = await res.json();
+  } catch {
+    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error('Is the server running? Start with: teamclaude server');
+    process.exit(1);
+  }
+  if (!data || typeof data !== 'object' || !Array.isArray(data.accounts)) {
+    console.error(`Unexpected reply from localhost:${port} — not a teamclaude status.`);
+    process.exit(1);
+  }
+  if (!data.burn || typeof data.burn !== 'object') {
+    console.error('This server reports no burn figures — an older version; restart it to pick up the new one.');
+    process.exit(1);
+  }
+  if (json) {
+    await writeStdout(`${JSON.stringify(data.burn, null, 2)}\n`);
+    return;
+  }
+  await writeStdout(`${renderBurn(data.burn, { color })}\n`);
+}
+
 // ── relogin-check ───────────────────────────────────────────
 
 // `teamclaude relogin-check` — have the running server verify every OAuth
@@ -2815,6 +2863,8 @@ Commands:
                       'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  burn [--json]       Burn per hour: how fast each provider's pool and each
+                      account spend their quota windows and tokens (live)
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
   dashboard           Open the web dashboard of a running server in the browser
