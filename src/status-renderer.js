@@ -3,6 +3,7 @@ import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage,
 import { safeLine } from './safe-text.js';
 import { ROUTE_COLORS } from './config-ops.js';
 import { describeRouting } from './account-routing.js';
+import { needsRelogin } from './account-manager.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -386,6 +387,10 @@ export function unavailableLine(account, paint) {
   const err = reason === 'error' ? account.errorReason : null;
   const text = err
     ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
+    // Without a recorded reason, the look-ahead check (needsRelogin) still
+    // names the remedy rather than sending the operator to the logs.
+    : reason === 'error' && needsRelogin(account)
+      ? 'refresh token rejected — sign in again (teamclaude login, or `l` in the TUI)'
     : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
@@ -651,12 +656,15 @@ function formatAccountStatus(account, now, paint) {
   const parts = [];
   if (account.disabled) parts.push(paint.gray('disabled'));
 
-  const status = safeLine(account.status || 'unknown', 32) || 'unknown';
+  // An OAuth account in `error` is one a new sign-in repairs, and that is the
+  // word for it: `error` sent operators to the logs for a cause they could do
+  // nothing about there, when the next step was `teamclaude login`.
+  const status = needsRelogin(account) ? 'relogin' : (safeLine(account.status || 'unknown', 32) || 'unknown');
   const colored = status === 'active'
     ? paint.green(status)
     : status === 'throttled'
       ? paint.yellow(status)
-      : status === 'error' || status === 'exhausted'
+      : status === 'error' || status === 'exhausted' || status === 'relogin'
         ? paint.red(status)
         : status;
   parts.push(colored);

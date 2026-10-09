@@ -284,6 +284,14 @@ server takes the new token at its next pass, and **R** in its TUI starts one. Th
 then holds the account too, which is safe: callback.net makes the installs take turns to refresh a
 token. See [Syncing accounts across machines](#syncing-accounts-across-machines-callbacknet).
 
+### Knowing before a request fails (`relogin`)
+
+A rotated-away refresh token is only discovered when it is used, and it is used when the access token runs out — hours after the `/login` elsewhere that killed it. Until then the account read `active`, and the request that found out was lost.
+
+So the server looks ahead. At startup, and at the start of every [quota-probe](quota.md#quota-probe) pass, every OAuth account (Claude or Codex) whose access token has expired or expires within the hour has it refreshed in the background. That is the same refresh the next request would have made, only earlier: a refresh token upstream rejects marks the account `relogin` exactly as it would have on use — the row in the TUI, the account in `teamclaude status`, and `needsRelogin: true` on it in `/teamclaude/status` all say so, and the `l` key opens on it. A transient failure (network, a 5xx) changes nothing: the account keeps its token and is tried again on the next pass or the next request. An account that is disabled, already in `relogin`, or carries a third-party credential is left alone, as it is on use.
+
+With the probe off (the default) the check runs at startup only; `teamclaude probe <seconds>` makes it periodic. `reloginCheck: false` in the config turns it off altogether.
+
 ## The `id` field
 
 Every account entry carries an `id`, added the first time the config is read and written back on the next save. It is what ties an entry to the running account built from it: entries without a usable credential are skipped at startup, so an entry's place in the file is not the account's place in the fleet, and a token refreshed for one account would otherwise be recorded against another.

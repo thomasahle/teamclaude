@@ -88,6 +88,28 @@ const ROUTING_FAILURE_COOLDOWN_SECONDS = 30;
 // request an hour, which is cheap, while a fallback account silently dead for
 // good is not.
 export const CREDENTIAL_REJECTED_COOLDOWNS_SECONDS = [60, 5 * 60, 15 * 60, 60 * 60];
+// How far ahead the re-login check looks (refreshExpiringTokens): a token due
+// within this window is refreshed now, so a dead refresh token is found — and
+// the account marked — before a request has to fail on it. An hour, because
+// the check runs at startup and once per probe pass, and a token that lasts
+// longer than that is not the next thing to fail.
+export const RELOGIN_CHECK_WINDOW_MS = 60 * 60 * 1000;
+
+/**
+ * Whether the only way back into rotation for this account is a new sign-in.
+ *
+ * `error` is the one hard state for an OAuth account, and every path that sets
+ * it names the same remedy: the refresh token was rejected (ensureTokenFresh),
+ * or the access token was and refreshing did not help (markCredentialRejected)
+ * — so "run: teamclaude login" is what the status readouts say for it, and what
+ * the `l` key is for. An API key answers a 401 with a cooldown instead (its
+ * `credentialRejectedUntil`), never with this. Reads a status payload as well
+ * as a live account: both carry `type` and `status`.
+ * @param {{ type?: string, status?: string } | null | undefined} account
+ */
+export function needsRelogin(account) {
+  return account?.type === 'oauth' && account?.status === 'error';
+}
 
 // Codex model-scoped weekly buckets are keyed by slugs taken from response
 // header NAMES, so the table needs a ceiling an upstream cannot talk past.
@@ -4862,9 +4884,15 @@ export class AccountManager {
   /**
    * Ensure an OAuth account's token is fresh, refreshing if needed.
    * Pass force=true to refresh regardless of expiry (e.g. after a 401).
+   * `expiringWithinMs` widens the "needed" window from the five minutes the
+   * send path uses (the re-login check passes an hour); absent, the default
+   * of isTokenExpiringSoon applies.
    * Concurrent calls for the same account coalesce into a single refresh.
+   * @param {number} accountIndex
+   * @param {boolean} [force]
+   * @param {{ expiringWithinMs?: number }} [opts]
    */
-  async ensureTokenFresh(accountIndex, force = false) {
+  async ensureTokenFresh(accountIndex, force = false, { expiringWithinMs = undefined } = {}) {
     const account = this.accounts[accountIndex];
     // A third-party backend (`upstream` set) carries a DIFFERENT provider's
     // credential; the token endpoint here is Anthropic's, so refreshing would
@@ -4898,7 +4926,7 @@ export class AccountManager {
       return;
     }
 
-    if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
+    if (!force && !isTokenExpiringSoon(account.expiresAt, expiringWithinMs)) return;
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
     // already in flight when the token went bad comes back rejected, and each
@@ -4999,6 +5027,46 @@ export class AccountManager {
     })();
 
     return account._refreshPromise;
+  }
+
+  /**
+   * The re-login check: refresh now every OAuth token that has expired or
+   * will within `withinMs`, so an account whose refresh token upstream has
+   * rotated away is marked before a request has to find out.
+   *
+   * Until now an account read `active` until the first request after its
+   * access token expired hit the dead refresh token — hours after the `/login`
+   * elsewhere that killed it — and that request was lost. An operator looking
+   * at the dashboard could not tell which accounts were about to fail. Run at
+   * startup and once per probe pass (prober.js), this is the same refresh the
+   * send path makes, just earlier: a rejection lands in ensureTokenFresh's own
+   * catch, which marks the account `error` and arms the dead-token guard
+   * exactly as it would on use, and a transient failure (network, 5xx) leaves
+   * the account as it was, to be retried on the next pass or the next request.
+   * Nothing here marks anything itself.
+   *
+   * The accounts left alone are the ones the on-use path would never refresh
+   * either: no refresh token or a third-party credential (`upstream`), one the
+   * operator disabled, and one already in `error` — the dead-token guard would
+   * decline the refresh, and an `error` from an access-token rejection is not
+   * something another refresh repairs. Every refresh runs at once; a slow one
+   * does not hold the rest. Resolves with the accounts that were refreshed.
+   *
+   * @param {{ withinMs?: number }} [opts]
+   * @returns {Promise<Record<string, any>[]>}
+   */
+  async refreshExpiringTokens({ withinMs = RELOGIN_CHECK_WINDOW_MS } = {}) {
+    const due = this.accounts.filter(account => account.type === 'oauth'
+      && !!account.refreshToken && !account.upstream && !account.disabled
+      && account.status !== 'error'
+      && isTokenExpiringSoon(account.expiresAt, withinMs));
+    if (!due.length) return due;
+    const minutes = Math.round(withinMs / 60_000);
+    console.log(`[TeamClaude] Refreshing ${due.length} OAuth token(s) due within ${minutes} min, so a rejected one is reported before a request fails on it`);
+    // ensureTokenFresh reports its own failures and never rejects; the catch is
+    // for a refresh coordinator that does.
+    await Promise.all(due.map(account => this.ensureTokenFresh(account.index, false, { expiringWithinMs: withinMs }).catch(() => {})));
+    return due;
   }
 
   /**
@@ -5332,6 +5400,10 @@ export class AccountManager {
         status: a.status,
         // What put it in 'error' and what brings it back; null in every other state.
         errorReason: a.status === 'error' && a.errorReason ? { ...a.errorReason } : null,
+        // The one `error` a new sign-in repairs, said as such: `status` keeps
+        // its word for every reader that keys on it, and the TUI, `teamclaude
+        // status` and the `l` key read this to say `relogin` instead.
+        needsRelogin: needsRelogin(a),
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).

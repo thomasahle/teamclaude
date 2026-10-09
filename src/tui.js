@@ -12,6 +12,7 @@ import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits, showSessionRow } from './status-renderer.js';
+import { needsRelogin } from './account-manager.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
@@ -1248,7 +1249,7 @@ export class TUI {
     // it, so the common case is `l`, Enter.
     else if (k === 'l' && this.loginAccount && this.am.accounts.length > 0) {
       const order = this._displayOrder();
-      const broken = order.find((/** @type {number} */ i) => this.am.accounts[i]?.status === 'error');
+      const broken = order.find((/** @type {number} */ i) => needsRelogin(this.am.accounts[i]));
       this.mode = 'select'; this.selAction = 'login'; this.selReturn = 'normal';
       this.selIdx = broken ?? order[0] ?? 0;
     }
@@ -3111,7 +3112,10 @@ export class TUI {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'throttled': status = yellow('throttled'); break;
       case 'exhausted': status = red('exhausted'); break;
-      case 'error':     status = red('error'); break;
+      // An OAuth account in `error` needs a sign-in and nothing else, so the
+      // row says so (the `l` key opens on it); `error` sent operators to the
+      // activity pane for a cause they could not act on there.
+      case 'error':     status = red(needsRelogin(a) ? 'relogin' : 'error'); break;
       default:          status = a.status || 'ready';
     }
     status = rpad(status, 10);

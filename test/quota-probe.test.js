@@ -462,7 +462,9 @@ test('prober skips an account holding a rejected refresh token, until a new one 
   assert.equal(refreshes, 1);
 
   // A re-login lifts the skip: the manager's guard is keyed on the token value.
-  am.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() + 3600_000 });
+  // The new token is good for well past the re-login check's one-hour window
+  // (relogin-check.test.js), so this pass probes rather than refreshes.
+  am.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() + 2 * 3600_000 });
   await prober.probeAll();
   assert.equal(probes, probesAfterRejection + 1);
 });

@@ -52,7 +52,7 @@ export class Prober {
   // notices below are produced later still, by a reload that changes the probe
   // interval, so a captured `console.log` would put them on a terminal the
   // alternate screen has already covered.
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = (/** @type {string} */ line) => console.log(line) } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, reloginCheck = true, log = (/** @type {string} */ line) => console.log(line) } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
@@ -60,6 +60,11 @@ export class Prober {
     this.profileFn = profileFn;
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
+    // Whether each pass starts with the re-login check (config `reloginCheck`,
+    // on unless set to false): every OAuth token due within the hour is
+    // refreshed first, so an account whose refresh token has died is marked
+    // before a request fails on it — see AccountManager.refreshExpiringTokens.
+    this.reloginCheck = reloginCheck;
     this.log = log;
     this.timer = null;
     this._running = false;
@@ -106,6 +111,13 @@ export class Prober {
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
+      // Before the reads, so an account the check marks `error` is left out
+      // of this pass by _probeable rather than probed with a token that cannot
+      // be refreshed. The manager is a stand-in without the method in some
+      // embedders' tests; the check is then simply not run.
+      if (this.reloginCheck && typeof this.am.refreshExpiringTokens === 'function') {
+        await this.am.refreshExpiringTokens().catch(() => {});
+      }
       const accounts = this.am.accounts.filter(account =>
         this._probeable(account) && (this._isProbeTarget(account) || this._isCodexProbeTarget(account) || this._isBackendTarget(account)));
       await Promise.all(accounts.map(account => this.probeAccount(account)));

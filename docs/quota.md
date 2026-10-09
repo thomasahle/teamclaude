@@ -40,6 +40,8 @@ The probe is also the only source for the **Sonnet 7-day** bucket, when your pla
 
 It is likewise the only source for Claude's [banked usage-limit resets](accounts.md#claude-banked-usage-limit-resets), read from the same call.
 
+Each pass begins with the [re-login check](accounts.md#knowing-before-a-request-fails-relogin): every OAuth token due to expire within the hour is refreshed first, so an account whose refresh token upstream has rotated away reads `relogin` before a request fails on it, and is left out of the pass. `reloginCheck: false` in the config turns that off.
+
 ### Revalidating a spent family bucket
 
 Those `7d_oi` headers ride on **Fable responses only** — no other model's response carries them. That makes a spent Fable (or Sonnet) reading self-sealing: once it reads at or above the switch threshold, rotation stops sending that family to the account, which is also the only thing that could have refreshed the reading ([#167](https://github.com/KarpelesLab/teamclaude/issues/167)).

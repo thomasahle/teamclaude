@@ -641,6 +641,9 @@ async function serverCommand() {
         config.quotaProbeSeconds = diskConfig.quotaProbeSeconds || 0;
         prober.reschedule(ms);
       }
+      // Read by the prober at the start of each pass, so this applies to the next one.
+      config.reloginCheck = diskConfig.reloginCheck !== false;
+      prober.reloginCheck = config.reloginCheck;
     }
     if (warmer) {
       const diskSchedule = diskConfig.warmupSchedule || null;
@@ -970,12 +973,18 @@ async function serverCommand() {
   prober = new Prober(accountManager, {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,
+    reloginCheck: config.reloginCheck !== false,
   });
   // The web dashboard's one-shot probe button uses the same zero-spend action
   // as the TUI's `p` key. Assigned after construction because the hook object
   // is already shared with the server created above.
   hooks.probeQuota = () => prober?.probeAll();
   prober.start();
+  // The re-login check, once at startup; each probe pass repeats it. In the
+  // background: a token refresh is upstream traffic, and the listener is
+  // already up. With the probe on, its first pass runs the same check and the
+  // two coalesce on the account's refresh slot (ensureTokenFresh).
+  if (config.reloginCheck !== false) accountManager.refreshExpiringTokens().catch(() => {});
   // A money cap (accounts[].maxSpend) is judged against the month-to-date
   // figure only the probe refreshes — a response carries none — so with the
   // probe off it binds only after a manual `p` refresh. Said once at start,
