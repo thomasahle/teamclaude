@@ -223,6 +223,10 @@ switch (command) {
     await redeemCommand();
     process.exit(0);
     break;
+  case 'autoredeem':
+    await autoRedeemCommand();
+    process.exit(0);
+    break;
   case 'remove':
     await removeCommand();
     process.exit(0);
@@ -1968,6 +1972,37 @@ async function redeemCommand() {
   }
 }
 
+// `teamclaude autoredeem [on|off]` — the fleet switch for spending Codex reset
+// credits automatically (`autoRedeemResets`), for a server running as a
+// background service where the TUI's settings screen is out of reach. The write
+// goes through the config lock like every other setting change: saving this
+// process's own copy of the file would put back whatever token a running server
+// had rotated since it was read.
+async function autoRedeemCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+  const current = config.autoRedeemResets === true;
+  if (arg === undefined) {
+    console.log(`Automatic reset redemption: ${current ? 'on' : 'off'}`);
+    console.log('Set with: teamclaude autoredeem <on|off>');
+    console.log('On: when a spent weekly window leaves no Codex account able to serve a request,');
+    console.log('the server spends ONE banked reset credit (the one expiring soonest) and retries.');
+    return;
+  }
+  let next;
+  if (['on', 'true', 'yes', '1'].includes(arg)) next = true;
+  else if (['off', 'false', 'no', '0'].includes(arg)) next = false;
+  else {
+    console.error('Usage: teamclaude autoredeem <on|off>');
+    process.exit(1);
+  }
+  if (next !== current) await atomicConfigUpdate(c => { c.autoRedeemResets = next; });
+  console.log(next
+    ? 'Automatic reset redemption on: a credit is spent only when no Codex account can serve a request.'
+    : 'Automatic reset redemption off: credits are spent only by `teamclaude redeem <account>`.');
+  await notifyRunningServer(config);
+}
+
 // Manual account switch against a RUNNING server — the headless equivalent of
 // pressing 's' in the TUI, which is unreachable when the proxy runs as a
 // background service. Nothing is written to the config: like the TUI's switch
@@ -3134,6 +3169,8 @@ Commands:
   redeem <name>       Spend ONE of a Codex account's banked rate-limit reset
                       credits (as '/usage' -> 'Redeem reset' in a signed-in
                       Codex client); the running server does the spending
+  autoredeem [on|off] Let the server spend one such credit by itself whenever
+                      no Codex account can serve a request (off by default)
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)

@@ -476,6 +476,16 @@ dry it runs. The switch is fleet-scoped because the policy below is — "only wh
 the whole pool is dry" is a statement about the fleet, not about one account —
 and it applies live, so it can be armed or killed without a restart.
 
+Two commands drive the same machinery from a shell, for a server running as a
+background service. `teamclaude autoredeem [on|off]` reads or sets the fleet
+switch above, through the config lock, and a running server applies it at once.
+`teamclaude redeem <account>` spends ONE credit on the named account, now, with
+no policy applied — the fleet switch can be off and the weekly window healthy —
+because naming the account is the decision. It shares the automatic path's
+safeguards for the call itself: a retry after an unread answer replays the same
+idempotency key, so upstream answers `already_redeemed` rather than spending a
+second credit, and the automatic path holds off afterwards.
+
 One account can be exempted with `accounts[].autoRedeemReset: false`, and that
 is **all** that key can do. A per-account `true` arms nothing on its own: with
 `autoRedeemResets` off, no account spends anything.
