@@ -40,6 +40,20 @@ const STATUS_CACHE_MS = 5000;
 const num = (/** @type {unknown} */ v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
 /**
+ * The key a series is kept under: the provider and the name. One hub can
+ * hold the same login as an Anthropic account and as a Codex account — the
+ * same email, two subscriptions — and keyed by name alone their readings
+ * interleaved into one series whose every alternation between the two levels
+ * counted as growth: hundreds of percent an hour, reported for both
+ * providers. The pair is the account's identity here; `name` and `provider`
+ * travel beside it for display.
+ * @param {{ name?: string, provider?: string, type?: string }} account
+ */
+export function burnKey(account) {
+  return `${providerOf(account)}/${account?.name}`;
+}
+
+/**
  * @typedef {{ t: number, unified5h: number|null, unified7d: number|null, scopedWeekly: Record<string, number>, inputTokens: number|null, outputTokens: number|null }} BurnSample
  * @typedef {{ perHour1h: number|null, perHour24h: number|null }} SeriesRates
  */
@@ -185,8 +199,10 @@ export class BurnTracker {
     this.retentionMs = retentionMs;
     this.now = now;
     this.log = log;
-    /** @type {Map<string, BurnSample[]>} oldest first, per account name */
+    /** @type {Map<string, BurnSample[]>} oldest first, per burnKey */
     this.samples = new Map();
+    /** @type {Map<string, { provider: string, name: string }>} what each key stands for, for the log rows */
+    this.meta = new Map();
     this._seq = 0;
     /** @type {{ seq: number, now: number, n: number, value: any }|null} */
     this._cache = null;
@@ -195,18 +211,29 @@ export class BurnTracker {
     this._writeFailed = false;
   }
 
+  /** The series of an account, created on first sight along with what its key stands for. */
+  _ring(account) {
+    const key = burnKey(account);
+    let ring = this.samples.get(key);
+    if (!ring) {
+      ring = [];
+      this.samples.set(key, ring);
+      this.meta.set(key, { provider: providerOf(account), name: String(account?.name ?? '') });
+    }
+    return { key, ring };
+  }
+
   /**
    * Record a reading for an account. A probe result (`force`) always lands;
    * a header reading only when the last sample is MIN_SAMPLE_GAP_MS old.
-   * @param {string} name
+   * @param {{ name?: string, provider?: string, type?: string }} account  the series is the provider and the name (burnKey)
    * @param {{ unified5h?: unknown, unified7d?: unknown, scopedWeekly?: Record<string, unknown>, inputTokens?: unknown, outputTokens?: unknown }} reading
    * @param {{ force?: boolean }} [opts]
    * @returns {boolean} whether it was kept
    */
-  record(name, reading, { force = false } = {}) {
+  record(account, reading, { force = false } = {}) {
     const t = this.now();
-    let ring = this.samples.get(name);
-    if (!ring) { ring = []; this.samples.set(name, ring); }
+    const { key, ring } = this._ring(account);
     const last = ring[ring.length - 1];
     if (!force && last && t - last.t < MIN_SAMPLE_GAP_MS) return false;
     const sample = makeSample(t, reading);
@@ -216,7 +243,7 @@ export class BurnTracker {
     if (last && last.t > t) ring.sort((a, b) => a.t - b.t);
     this._trim(ring, t);
     this._seq++;
-    this._append(name, sample);
+    this._append(key, sample);
     return true;
   }
 
@@ -226,9 +253,11 @@ export class BurnTracker {
     while (ring.length > MAX_SAMPLES) ring.shift();
   }
 
-  _append(name, sample) {
+  _append(key, sample) {
     if (!this.path) return;
-    const line = JSON.stringify({ name, ...sample }) + '\n';
+    // The provider rides on every row: the name alone does not say which
+    // series a row belongs to (see burnKey).
+    const line = JSON.stringify({ ...this.meta.get(key), ...sample }) + '\n';
     this._writes = this._writes
       .then(() => appendFile(/** @type {string} */ (this.path), line, { mode: 0o600 }))
       .catch(err => {
@@ -247,9 +276,15 @@ export class BurnTracker {
    * Read the log back, keep what is still within retention, and compact the
    * file to exactly that — so expired samples and a line cut short by a
    * crash mid-append (skipped here) do not accumulate.
+   *
+   * A row from before the provider was written (name only) is attributed to
+   * the one account in `accounts` that carries its name; a name held by more
+   * than one provider, or by none, cannot be placed and is dropped — once
+   * said, never guessed: a guess is the very mixing this key exists to end.
+   * @param {{ accounts?: { name?: string, provider?: string, type?: string }[] }} [opts]
    * @returns {Promise<{ loaded: number, dropped: number }>}
    */
-  async load() {
+  async load({ accounts = [] } = {}) {
     if (!this.path) return { loaded: 0, dropped: 0 };
     let text;
     try {
@@ -259,7 +294,10 @@ export class BurnTracker {
       throw err;
     }
     const cutoff = this.now() - this.retentionMs;
-    let loaded = 0, dropped = 0;
+    let loaded = 0, dropped = 0, legacyAmbiguous = 0, legacyUnknown = 0;
+    /** @type {Map<string, any>} name → the one account holding it, or null when several do */
+    const byName = new Map();
+    for (const a of accounts) byName.set(a.name, byName.has(a.name) ? null : a);
     /** @type {Map<string, BurnSample[]>} */
     const rings = new Map();
     for (const line of text.split('\n')) {
@@ -268,20 +306,33 @@ export class BurnTracker {
       try { row = JSON.parse(line); } catch { dropped++; continue; }
       if (!row || typeof row !== 'object' || typeof row.name !== 'string' || !Number.isFinite(row.t)) { dropped++; continue; }
       if (row.t < cutoff) { dropped++; continue; }
-      const { name, t, ...reading } = row;
-      let ring = rings.get(name);
-      if (!ring) { ring = []; rings.set(name, ring); }
+      let owner;
+      if (typeof row.provider === 'string' && row.provider) {
+        owner = { name: row.name, provider: safeLine(row.provider, 16) };
+      } else {
+        owner = byName.get(row.name);
+        if (!owner) {
+          dropped++;
+          if (byName.has(row.name)) legacyAmbiguous++; else legacyUnknown++;
+          continue;
+        }
+      }
+      const { key, ring } = this._ring(owner);
+      const { t, ...reading } = row;
       ring.push(makeSample(t, reading));
+      rings.set(key, ring);
       loaded++;
     }
-    for (const [name, ring] of rings) {
+    for (const ring of rings.values()) {
       ring.sort((a, b) => a.t - b.t);
       while (ring.length > MAX_SAMPLES) ring.shift();
-      this.samples.set(name, ring);
     }
     this._seq++;
+    if (legacyAmbiguous || legacyUnknown) {
+      this.log(`[TeamClaude] Burn log: ${legacyAmbiguous + legacyUnknown} sample(s) from before provider keys were dropped (${legacyAmbiguous} under a name held by more than one provider, ${legacyUnknown} under a name no account holds)`);
+    }
     const kept = [];
-    for (const [name, ring] of this.samples) for (const s of ring) kept.push(JSON.stringify({ name, ...s }));
+    for (const [key, ring] of this.samples) for (const s of ring) kept.push(JSON.stringify({ ...this.meta.get(key), ...s }));
     const tmp = `${this.path}.tmp`;
     try {
       await writeFile(tmp, kept.length ? `${kept.join('\n')}\n` : '', { mode: 0o600 });
@@ -293,16 +344,17 @@ export class BurnTracker {
     return { loaded, dropped };
   }
 
-  /** Every rate of one account. */
-  rates(name, now = this.now()) {
-    return accountRates(this.samples.get(name) || [], now);
+  /** Every rate of one account (its series is the provider and the name). */
+  rates(account, now = this.now()) {
+    return accountRates(this.samples.get(burnKey(account)) || [], now);
   }
 
   /**
    * The `burn` block of the status payload: per provider, each window's
-   * summed burn against the pool and the token rates; per account, the same
-   * without the pooled fields. `accounts` are the manager's live records
-   * (provider, disabled, status, quota).
+   * summed burn against the pool and the token rates; per account, keyed
+   * `<provider>/<name>` (burnKey) with `name` and `provider` inside for
+   * display, the same without the pooled fields. `accounts` are the
+   * manager's live records (provider, disabled, status, quota).
    * @param {Record<string, any>[]} accounts
    * @param {number} [now]
    */
@@ -315,10 +367,10 @@ export class BurnTracker {
     const groups = new Map();
     let latest = null;
     for (const account of accounts) {
-      const rates = accountRates(this.samples.get(account.name) || [], now);
+      const rates = accountRates(this.samples.get(burnKey(account)) || [], now);
       if (rates.sampledAt != null && (latest == null || rates.sampledAt > latest)) latest = rates.sampledAt;
       const provider = providerOf(account);
-      byAccount[account.name] = { provider, ...rates };
+      byAccount[burnKey(account)] = { name: account.name, provider, ...rates };
       let group = groups.get(provider);
       if (!group) { group = []; groups.set(provider, group); }
       group.push({ account, rates });

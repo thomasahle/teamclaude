@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, appendFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BurnTracker, burnPerHour, burnSummaryLines, formatRatePct, formatTokens, formatHours, formatUntil, BURN_RETENTION_MS, MIN_SAMPLE_GAP_MS } from '../src/burn.js';
+import { BurnTracker, burnKey, burnPerHour, burnSummaryLines, formatRatePct, formatTokens, formatHours, formatUntil, BURN_RETENTION_MS, MIN_SAMPLE_GAP_MS } from '../src/burn.js';
 import { renderBurn, renderStatus } from '../src/status-renderer.js';
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
@@ -12,11 +12,14 @@ import { RemoteAccountManager } from '../src/tui-remote.js';
 // Burn per hour (burn.js): the rates behind the provider lines of the TUI,
 // `teamclaude status` and `teamclaude burn`, from the quota readings the
 // server already takes. The rate math is pure over a sample list; the tracker
-// around it keeps the samples, in memory and in a JSONL log.
+// around it keeps the samples — one series per provider and name — in memory
+// and in a JSONL log.
 
 const MIN = 60_000, HOUR = 3600_000;
 const T0 = Date.parse('2026-07-03T12:00:00Z');
 const near = (actual, expected, eps = 1e-9) => assert.ok(actual != null && Math.abs(actual - expected) < eps, `${actual} is not near ${expected}`);
+const A = { name: 'a', type: 'oauth' };
+const B = { name: 'b', type: 'oauth' };
 
 /** A tracker on a clock the test moves. */
 function clocked(start = T0, opts = {}) {
@@ -36,9 +39,9 @@ test('burn: plain growth over the last hour and the last day', () => {
   // sample, the weekly 0.1%, Fable 0.2%; 1000 tokens in and 200 out each.
   for (let i = 0; i <= 144; i++) {
     clock.t = T0 - 24 * HOUR + i * 10 * MIN;
-    tracker.record('a', { unified5h: i * 0.01, unified7d: i * 0.001, scopedWeekly: { fable: i * 0.002 }, inputTokens: i * 1000, outputTokens: i * 200 }, { force: true });
+    tracker.record(A, { unified5h: i * 0.01, unified7d: i * 0.001, scopedWeekly: { fable: i * 0.002 }, inputTokens: i * 1000, outputTokens: i * 200 }, { force: true });
   }
-  const r = tracker.rates('a', T0);
+  const r = tracker.rates(A, T0);
   near(r.windows.unified5h.perHour1h, 0.06);
   near(r.windows.unified5h.perHour24h, 0.06);
   near(r.windows.unified7d.perHour1h, 0.006);
@@ -67,19 +70,19 @@ test('burn: a drop is a reset — a new segment, never negative burn', () => {
 
 test('burn: fewer than two readings of a series is no rate; a flat series is a rate of zero', () => {
   const { clock, tracker } = clocked();
-  assert.equal(tracker.rates('a').windows.unified5h.perHour1h, null, 'no samples at all');
-  tracker.record('a', { unified5h: 0.1 }, { force: true });
-  assert.equal(tracker.rates('a').windows.unified5h.perHour1h, null, 'one sample');
+  assert.equal(tracker.rates(A).windows.unified5h.perHour1h, null, 'no samples at all');
+  tracker.record(A, { unified5h: 0.1 }, { force: true });
+  assert.equal(tracker.rates(A).windows.unified5h.perHour1h, null, 'one sample');
   clock.t += 10 * MIN;
-  tracker.record('a', { unified7d: 0.2 }, { force: true });
-  const r = tracker.rates('a');
+  tracker.record(A, { unified7d: 0.2 }, { force: true });
+  const r = tracker.rates(A);
   assert.equal(r.windows.unified5h.perHour1h, null, 'the 5h series still has one reading');
   assert.equal(r.windows.unified7d.perHour1h, null);
   assert.equal(r.tokens.inPerHour1h, null);
   clock.t += 10 * MIN;
-  tracker.record('a', { unified5h: 0.3, unified7d: 0.2 }, { force: true });
-  near(tracker.rates('a').windows.unified5h.perHour1h, 0.2 / (20 / 60));
-  assert.equal(tracker.rates('a').windows.unified7d.perHour1h, 0);
+  tracker.record(A, { unified5h: 0.3, unified7d: 0.2 }, { force: true });
+  near(tracker.rates(A).windows.unified5h.perHour1h, 0.2 / (20 / 60));
+  assert.equal(tracker.rates(A).windows.unified7d.perHour1h, 0);
 });
 
 test('burn: the baseline just before a horizon is used, a distant one is not, and nothing inside the window is no rate', () => {
@@ -95,26 +98,93 @@ test('burn: the baseline just before a horizon is used, a distant one is not, an
 
 test('burn: header readings are folded to one a minute per account; a probe result always lands', () => {
   const { clock, tracker } = clocked();
-  assert.equal(tracker.record('a', { unified5h: 0.1 }), true);
+  assert.equal(tracker.record(A, { unified5h: 0.1 }), true);
   clock.t += 20_000;
-  assert.equal(tracker.record('a', { unified5h: 0.11 }), false, 'twenty seconds later: folded');
-  assert.equal(tracker.record('a', { unified5h: 0.12 }, { force: true }), true, 'a probe result lands regardless');
+  assert.equal(tracker.record(A, { unified5h: 0.11 }), false, 'twenty seconds later: folded');
+  assert.equal(tracker.record(A, { unified5h: 0.12 }, { force: true }), true, 'a probe result lands regardless');
   clock.t += MIN_SAMPLE_GAP_MS;
-  assert.equal(tracker.record('a', { unified5h: 0.13 }), true);
-  assert.equal(tracker.samples.get('a').length, 3);
-  assert.equal(tracker.record('b', { unified5h: 0.5 }), true, 'the gap is per account');
+  assert.equal(tracker.record(A, { unified5h: 0.13 }), true);
+  assert.equal(tracker.samples.get('anthropic/a').length, 3);
+  assert.equal(tracker.record(B, { unified5h: 0.5 }), true, 'the gap is per account');
 });
 
 test('burn: retention trims the ring to 48 h', () => {
   const { clock, tracker } = clocked(T0 - 60 * HOUR);
   for (let i = 0; i <= 60; i++) {
     clock.t = T0 - 60 * HOUR + i * HOUR;
-    tracker.record('a', { unified7d: i * 0.01 }, { force: true });
+    tracker.record(A, { unified7d: i * 0.01 }, { force: true });
   }
-  const ring = tracker.samples.get('a');
+  const ring = tracker.samples.get('anthropic/a');
   assert.equal(ring.length, 49);
   assert.equal(ring[0].t, T0 - BURN_RETENTION_MS, 'the oldest kept is exactly 48 h old');
-  near(tracker.rates('a', T0).windows.unified7d.perHour24h, 0.01);
+  near(tracker.rates(A, T0).windows.unified7d.perHour24h, 0.01);
+});
+
+// ── one series per provider and name ──────────────────────────
+
+test('burn: the same name under two providers is two series, and neither provider mixes them in', () => {
+  const { clock, tracker } = clocked(T0 - HOUR);
+  const claude = { name: 'me@x.com', type: 'oauth', quota: { unified7d: 0.63, unified7dReset: T0 + 24 * HOUR, scopedWeekly: {} } };
+  const codex = { name: 'me@x.com', type: 'oauth', provider: 'codex', accountId: 'acct', quota: { unified7d: 0.20, unified7dReset: T0 + 24 * HOUR, scopedWeekly: {} } };
+  assert.equal(burnKey(claude), 'anthropic/me@x.com');
+  assert.equal(burnKey(codex), 'codex/me@x.com');
+  // The readings alternate, as a hub holding both logins sees them: the
+  // Anthropic weekly at 0.61 and climbing slowly, the Codex one at 0.18. Keyed
+  // by name alone, every alternation read as 0.43 of growth.
+  for (let i = 0; i <= 6; i++) {
+    clock.t = T0 - HOUR + i * 10 * MIN;
+    tracker.record(claude, { unified7d: 0.61 + i * 0.003, inputTokens: i * 1000 }, { force: true });
+    if (i < 6) {
+      clock.t += 5 * MIN;
+      tracker.record(codex, { unified7d: 0.18 + i * 0.001 }, { force: true });
+    }
+  }
+  near(tracker.rates(claude, T0).windows.unified7d.perHour1h, 0.018);
+  near(tracker.rates(codex, T0).windows.unified7d.perHour1h, 0.005 / (50 / 60));
+  const s = tracker.status([claude, codex], T0);
+  near(s.byProvider.anthropic.windows.unified7d.perHour1h, 0.018);
+  near(s.byProvider.codex.windows.unified7d.perHour1h, 0.006);
+  near(s.byProvider.anthropic.tokens.inPerHour1h, 6000);
+  assert.equal(s.byProvider.codex.tokens.inPerHour1h, null, 'the Codex series has no token readings of its own');
+  assert.deepEqual(Object.keys(s.byAccount).sort(), ['anthropic/me@x.com', 'codex/me@x.com']);
+  assert.equal(s.byAccount['anthropic/me@x.com'].name, 'me@x.com');
+  assert.equal(s.byAccount['codex/me@x.com'].provider, 'codex');
+  near(s.byAccount['codex/me@x.com'].windows.unified7d.perHour1h, 0.006);
+  const out = renderBurn(s, { color: false, now: T0 });
+  assert.match(out, /^  me@x\.com\s+anthropic\s+- \/ -\s+1\.8% \/ 1\.8%\s+6k \/ 6k/m);
+  assert.match(out, /^  me@x\.com\s+codex\s+- \/ -\s+0\.6% \/ 0\.6%\s+- \/ -/m);
+});
+
+test('burn: legacy rows without a provider are placed by name, and dropped when the name is held by two providers or by none', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-burn-legacy-'));
+  const path = join(dir, 'teamclaude.burn.jsonl');
+  const rows = [
+    { name: 'only@x.com', t: T0 - 10 * MIN, unified7d: 0.1 },
+    { name: 'only@x.com', t: T0, unified7d: 0.2 },
+    { name: 'me@x.com', t: T0 - 10 * MIN, unified7d: 0.61 },
+    { name: 'me@x.com', t: T0 - 5 * MIN, unified7d: 0.18 },
+    { name: 'gone@x.com', t: T0, unified7d: 0.5 },
+    { provider: 'codex', name: 'me@x.com', t: T0 - 2 * MIN, unified7d: 0.19 },
+  ];
+  await writeFile(path, rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+  const lines = [];
+  const tracker = new BurnTracker({ path, now: () => T0, log: l => lines.push(l) });
+  const accounts = [
+    { name: 'only@x.com', type: 'oauth' },
+    { name: 'me@x.com', type: 'oauth' },
+    { name: 'me@x.com', type: 'oauth', provider: 'codex', accountId: 'x' },
+  ];
+  assert.deepEqual(await tracker.load({ accounts }), { loaded: 3, dropped: 3 });
+  assert.equal(tracker.rates(accounts[0], T0).samples, 2, 'a name one account holds is placed');
+  assert.equal(tracker.rates(accounts[1], T0).samples, 0, 'a name two providers hold is not guessed');
+  assert.equal(tracker.rates(accounts[2], T0).samples, 1, 'a row that names its provider lands as written');
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /3 sample\(s\) from before provider keys were dropped \(2 under a name held by more than one provider, 1 under a name no account holds\)/);
+  // The compacted file names the provider on every row.
+  const kept = (await readFile(path, 'utf-8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(kept.length, 3);
+  assert.ok(kept.every(r => typeof r.provider === 'string' && typeof r.name === 'string'));
+  assert.deepEqual(kept.map(r => `${r.provider}/${r.name}`).sort(), ['anthropic/only@x.com', 'anthropic/only@x.com', 'codex/me@x.com']);
 });
 
 // ── persistence ───────────────────────────────────────────────
@@ -125,26 +195,27 @@ test('burn: persistence round trip, compacted on load, with a corrupted trailing
   const { clock, tracker } = clocked(T0 - 50 * HOUR, { path });
   for (let i = 0; i <= 50; i++) {
     clock.t = T0 - 50 * HOUR + i * HOUR;
-    tracker.record('a', { unified5h: i * 0.01, inputTokens: i * 100 }, { force: true });
+    tracker.record(A, { unified5h: i * 0.01, inputTokens: i * 100 }, { force: true });
   }
-  tracker.record('b', { unified7d: 0.4 }, { force: true });
+  tracker.record(B, { unified7d: 0.4 }, { force: true });
   await tracker.flush();
   const written = (await readFile(path, 'utf-8')).split('\n').filter(Boolean);
   assert.equal(written.length, 52, 'one line per sample, appended as they came');
+  assert.deepEqual(Object.keys(JSON.parse(written[0])).slice(0, 3), ['provider', 'name', 't']);
   // A crash mid-append leaves a line cut short.
-  await appendFile(path, '{"name":"a","t":17000000');
+  await appendFile(path, '{"provider":"anthropic","name":"a","t":17000000');
 
   const { clock: clock2, tracker: again } = clocked(T0, { path });
   assert.deepEqual(await again.load(), { loaded: 50, dropped: 3 }, '49 of a within 48 h and one of b; two expired, one cut short');
-  near(again.rates('a', T0).windows.unified5h.perHour24h, 0.01);
-  near(again.rates('a', T0).tokens.inPerHour24h, 100);
-  assert.equal(again.rates('b', T0).samples, 1);
+  near(again.rates(A, T0).windows.unified5h.perHour24h, 0.01);
+  near(again.rates(A, T0).tokens.inPerHour24h, 100);
+  assert.equal(again.rates(B, T0).samples, 1);
   const compacted = (await readFile(path, 'utf-8')).split('\n').filter(Boolean);
   assert.equal(compacted.length, 50, 'compacted to what was kept');
   assert.ok(compacted.every(line => JSON.parse(line).t >= T0 - BURN_RETENTION_MS));
   // New samples go on the end of the compacted file.
   clock2.t = T0 + MIN;
-  again.record('b', { unified7d: 0.41 }, { force: true });
+  again.record(B, { unified7d: 0.41 }, { force: true });
   await again.flush();
   assert.equal((await readFile(path, 'utf-8')).split('\n').filter(Boolean).length, 51);
   // No file is an empty history, not an error.
@@ -153,12 +224,12 @@ test('burn: persistence round trip, compacted on load, with a corrupted trailing
   // A log that cannot be written is said once and the rates go on in memory.
   const lines = [];
   const unwritable = new BurnTracker({ path: join(dir, 'missing-dir', 'x.jsonl'), log: l => lines.push(l) });
-  unwritable.record('a', { unified5h: 0.1 }, { force: true });
-  unwritable.record('a', { unified5h: 0.2 }, { force: true });
+  unwritable.record(A, { unified5h: 0.1 }, { force: true });
+  unwritable.record(A, { unified5h: 0.2 }, { force: true });
   await unwritable.flush();
   assert.equal(lines.length, 1);
   assert.match(lines[0], /Could not write the burn log/);
-  assert.equal(unwritable.samples.get('a').length, 2);
+  assert.equal(unwritable.samples.get('anthropic/a').length, 2);
 });
 
 // ── per provider ──────────────────────────────────────────────
@@ -172,7 +243,8 @@ test('burn: per-provider aggregate, the pooled remaining capacity and the time t
     { name: 'dead', type: 'oauth', status: 'error', quota: { unified5h: 0, unified7d: 0, scopedWeekly: {} } },
     { name: 'k', type: 'oauth', provider: 'codex', accountId: 'x', quota: { unified5h: 0.10, unified7d: 0.20, scopedWeekly: {} } },
   ];
-  const at = (t, rows) => { clock.t = t; for (const [name, r] of rows) tracker.record(name, r, { force: true }); };
+  const byName = Object.fromEntries(accounts.map(a => [a.name, a]));
+  const at = (t, rows) => { clock.t = t; for (const [name, r] of rows) tracker.record(byName[name], r, { force: true }); };
   // An hour ago and now: a spends 0.10 of its 5h and 0.05 of its weekly, b 0.20
   // and 0.10, the Codex account 0.05 and 0.01; the two out of rotation spend nothing.
   at(T0 - HOUR, [['a', { unified5h: 0.50, unified7d: 0.45, inputTokens: 0, outputTokens: 0 }], ['b', { unified5h: 0.60, unified7d: 0.80, inputTokens: 0, outputTokens: 0 }],
@@ -206,14 +278,15 @@ test('burn: per-provider aggregate, the pooled remaining capacity and the time t
   assert.equal(cx.windows.unified5h.runsOutBeforeReset, null, 'no reset known, no verdict');
   assert.equal(cx.tokens.inPerHour1h, null, 'no counters were sampled for it');
   // Per account: the same rates, without the pooled fields.
-  near(s.byAccount.a.windows.unified5h.perHour1h, 0.10);
-  assert.equal(s.byAccount.a.provider, 'anthropic');
-  assert.equal(s.byAccount.k.provider, 'codex');
-  assert.ok(!('pooledRemaining' in s.byAccount.a.windows.unified5h));
-  assert.equal(s.byAccount.dead.windows.unified5h.perHour1h, 0);
+  near(s.byAccount['anthropic/a'].windows.unified5h.perHour1h, 0.10);
+  assert.equal(s.byAccount['anthropic/a'].provider, 'anthropic');
+  assert.equal(s.byAccount['anthropic/a'].name, 'a');
+  assert.equal(s.byAccount['codex/k'].provider, 'codex');
+  assert.ok(!('pooledRemaining' in s.byAccount['anthropic/a'].windows.unified5h));
+  assert.equal(s.byAccount['anthropic/dead'].windows.unified5h.perHour1h, 0);
   // Computed once for a few seconds; a new sample invalidates it.
   assert.equal(tracker.status(accounts, T0 + 1000), s);
-  tracker.record('a', { unified5h: 0.61 }, { force: true });
+  tracker.record(byName.a, { unified5h: 0.61 }, { force: true });
   assert.notEqual(tracker.status(accounts, T0 + 1000), s);
 });
 
@@ -244,9 +317,9 @@ function samplePayload() {
       codex: { accounts: 1, windows: { unified5h: w(null, null), unified7d: w(null, null), scopedWeekly: {} }, tokens: noTokens },
     },
     byAccount: {
-      'alice@x.com': { provider: 'anthropic', windows: { unified5h: { perHour1h: 0.11, perHour24h: 0.095 }, unified7d: { perHour1h: 0.019, perHour24h: 0.017 }, scopedWeekly: {} },
+      'anthropic/alice@x.com': { name: 'alice@x.com', provider: 'anthropic', windows: { unified5h: { perHour1h: 0.11, perHour24h: 0.095 }, unified7d: { perHour1h: 0.019, perHour24h: 0.017 }, scopedWeekly: {} },
         tokens: { inPerHour1h: 1_200_000, outPerHour1h: 300_000, inPerHour24h: 1_000_000, outPerHour24h: 250_000 }, samples: 13, sampledAt: T0 },
-      'k@x.com': { provider: 'codex', windows: { unified5h: { perHour1h: null, perHour24h: null }, unified7d: { perHour1h: null, perHour24h: null }, scopedWeekly: {} }, tokens: noTokens, samples: 1, sampledAt: T0 },
+      'codex/k@x.com': { name: 'k@x.com', provider: 'codex', windows: { unified5h: { perHour1h: null, perHour24h: null }, unified7d: { perHour1h: null, perHour24h: null }, scopedWeekly: {} }, tokens: noTokens, samples: 1, sampledAt: T0 },
     },
   };
 }
@@ -331,8 +404,8 @@ test('burn: the manager samples probe results and header readings, and the TUI d
   near(s.burn.byProvider.anthropic.windows.unified7d.perHour1h, 0.02);
   near(s.burn.byProvider.anthropic.windows.unified7d.exhaustHours1h, 24);
   assert.equal(s.burn.byProvider.anthropic.windows.unified7d.runsOutBeforeReset, true);
-  near(s.burn.byAccount['a@x.com'].tokens.inPerHour1h, 120_000);
-  assert.equal(s.burn.byAccount['a@x.com'].samples, 2);
+  near(s.burn.byAccount['anthropic/a@x.com'].tokens.inPerHour1h, 120_000);
+  assert.equal(s.burn.byAccount['anthropic/a@x.com'].samples, 2);
 
   const expected = /burn\s+anthropic  5h 11%\/h  wk 2\.0%\/h  tok 120k in\/30k out per h  wk pool 24h \(reset 3d\) — runs out before reset/;
   const live = frame(am);
@@ -344,13 +417,13 @@ test('burn: the manager samples probe results and header readings, and the TUI d
 
   // A header reading within a minute of the last sample is folded; a later one lands.
   am._sampleBurn(am.accounts[0]);
-  assert.equal(burn.samples.get('a@x.com').length, 2);
+  assert.equal(burn.samples.get('anthropic/a@x.com').length, 2);
   clock.t = T + MIN;
   am._sampleBurn(am.accounts[0]);
-  assert.equal(burn.samples.get('a@x.com').length, 3);
+  assert.equal(burn.samples.get('anthropic/a@x.com').length, 3);
   // The dedicated Fable field stands in for a scoped bucket the probe did not list.
   am.accounts[0].quota.unified7dFable = 0.3;
   clock.t = T + 2 * MIN;
   am._sampleBurn(am.accounts[0], { probe: true });
-  assert.equal(burn.samples.get('a@x.com')[3].scopedWeekly.fable, 0.3);
+  assert.equal(burn.samples.get('anthropic/a@x.com')[3].scopedWeekly.fable, 0.3);
 });

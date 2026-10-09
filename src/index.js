@@ -395,7 +395,8 @@ async function serverCommand() {
   // dashboards show, kept in a log beside the config so a restart keeps the
   // last two days of them. A log that cannot be read is an empty history.
   const burn = new BurnTracker({ path: getBurnLogPath() });
-  await burn.load().catch(err => console.error(`[TeamClaude] Could not read the burn log: ${err.message}`));
+  // The account list places rows written before the provider was (burn.js load).
+  await burn.load({ accounts }).catch(err => console.error(`[TeamClaude] Could not read the burn log: ${err.message}`));
   const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, reloginCheckWindowMs: config.reloginCheckWindowMs, burn, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one

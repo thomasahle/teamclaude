@@ -197,7 +197,8 @@ export function renderBurn(burn, { color = process.stdout.isTTY, now = Date.now(
   const rows = Object.entries(burn?.byAccount && typeof burn.byAccount === 'object' ? burn.byAccount : {});
   if (rows.length) {
     lines.push('');
-    const names = rows.map(([name]) => nameText(name));
+    // Keyed `<provider>/<name>` (burnKey); the name to print rides inside.
+    const names = rows.map(([key, a]) => nameText(a?.name ?? key));
     const nameW = Math.min(40, Math.max(7, ...names.map(s => s.length)));
     const cell = (/** @type {string} */ a, /** @type {string} */ b) => `${a} / ${b}`;
     lines.push(paint.dim(`  ${'Account'.padEnd(nameW)}  ${'Provider'.padEnd(9)}  ${'5h %/h'.padEnd(13)}  ${'wk %/h'.padEnd(13)}  ${'in tok/h'.padEnd(15)}  out tok/h`));

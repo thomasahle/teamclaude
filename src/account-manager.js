@@ -4613,7 +4613,7 @@ export class AccountManager {
     for (const [family, bucket] of Object.entries(q.scopedWeekly || {})) scopedWeekly[family] = bucket?.utilization;
     if (scopedWeekly.fable == null && q.unified7dFable != null) scopedWeekly.fable = q.unified7dFable;
     if (scopedWeekly.sonnet == null && q.unified7dSonnet != null) scopedWeekly.sonnet = q.unified7dSonnet;
-    this.burn.record(account.name, {
+    this.burn.record(account, {
       unified5h: q.unified5h, unified7d: q.unified7d, scopedWeekly,
       inputTokens: account.usage.totalInputTokens, outputTokens: account.usage.totalOutputTokens,
     }, { force: probe });

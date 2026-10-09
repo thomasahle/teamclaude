@@ -104,9 +104,12 @@ test('/teamclaude/status carries burn per provider and per account', async () =>
     // Every account the manager holds has counters, so an account that served
     // nothing reads a token rate of zero, not none.
     assert.equal(burn.byProvider.codex.tokens.inPerHour1h, 0);
-    near(burn.byAccount['alice@example.com'].windows.unified5h.perHour1h, 0.11);
-    assert.equal(burn.byAccount['alice@example.com'].samples, 2);
-    assert.equal(burn.byAccount.key.windows.unified5h.perHour1h, null);
+    // Keyed by provider and name: one login can be held under both providers.
+    near(burn.byAccount['anthropic/alice@example.com'].windows.unified5h.perHour1h, 0.11);
+    assert.equal(burn.byAccount['anthropic/alice@example.com'].samples, 2);
+    assert.equal(burn.byAccount['anthropic/alice@example.com'].name, 'alice@example.com');
+    assert.equal(burn.byAccount['codex/bot@example.com'].provider, 'codex');
+    assert.equal(burn.byAccount['anthropic/key'].windows.unified5h.perHour1h, null);
   });
 });
 
