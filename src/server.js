@@ -1224,7 +1224,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ ok: false, error: 'reset redemption not supported' }));
           return;
         }
-        const names = () => (accountManager.accounts || []).map(a => a.name);
+        const names = () => (accountManager.accounts || []).map((/** @type {Record<string, any>} */ a) => a.name);
         let target;
         try {
           const raw = await readControlBody(req);

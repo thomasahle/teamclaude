@@ -479,7 +479,7 @@ and it applies live, so it can be armed or killed without a restart.
 Two commands drive the same machinery from a shell, for a server running as a
 background service. `teamclaude autoredeem [on|off]` reads or sets the fleet
 switch above, through the config lock, and a running server applies it at once.
-`teamclaude redeem <account>` spends ONE credit on the named account, now, with
+`teamclaude redeem <account>` spends ONE credit — or, on a Claude account, one banked usage-limit reset — on the named account, now, with
 no policy applied — the fleet switch can be off and the weekly window healthy —
 because naming the account is the decision. It shares the automatic path's
 safeguards for the call itself: a retry after an unread answer replays the same

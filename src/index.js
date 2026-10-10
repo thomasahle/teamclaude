@@ -1069,9 +1069,14 @@ async function serverCommand() {
   // process. One credit per call; the caller says which account. The spending
   // itself is the redeemer's (idempotency key, unread-verdict hold, re-read of
   // the quota afterwards), the same code the automatic path runs.
-  hooks.redeemReset = async (index) => {
+  hooks.redeemReset = async (/** @type {number} */ index) => {
     const account = accountManager.accounts[index];
     if (!account) return { ok: false, error: 'no such account' };
+    if (providerOf(account) !== 'codex') {
+      const r = await claudeRedeemer.redeemOnRequest(account);
+      if (!r.redeemed) return { ok: false, account: account.name, error: r.reason };
+      return { ok: true, account: account.name, provider: 'anthropic', cleared: r.cleared ?? [], creditsLeft: r.resetsLeft ?? 0, code: r.result ?? null };
+    }
     const result = await redeemer.redeemOnRequest(account);
     if (!result.redeemed) {
       return { ok: false, account: account.name, error: result.reason, ...(result.creditsLeft != null ? { creditsLeft: result.creditsLeft } : {}) };
@@ -1942,7 +1947,7 @@ async function redeemCommand() {
   const headers = { 'x-api-key': config.proxy.apiKey };
   const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
   if (!name) {
-    console.error('Usage: teamclaude redeem <account>   (spends ONE of that Codex account\'s reset credits)');
+    console.error('Usage: teamclaude redeem <account>   (spends ONE banked reset on that Claude or Codex account)');
     console.error('See held credits with: teamclaude status');
     process.exit(1);
   }
@@ -1963,11 +1968,13 @@ async function redeemCommand() {
       }
       process.exit(1);
     }
-    console.log(`Redeemed one reset credit on "${data.account}": ${data.windowsReset} window(s) reset, ${data.creditsLeft} credit(s) left.`);
+    console.log(data.provider === 'anthropic'
+      ? `Redeemed a usage-limit reset on "${data.account}": cleared ${(data.cleared || []).join(', ') || 'its limits'}, ${data.creditsLeft} reset(s) left.`
+      : `Redeemed one reset credit on "${data.account}": ${data.windowsReset} window(s) reset, ${data.creditsLeft} credit(s) left.`);
   } catch (err) {
     console.error('Cannot connect to proxy at localhost:' + port);
     console.error('Is the server running? Start with: teamclaude server');
-    if (err?.message) console.error(`Details: ${err.message}`);
+    if (/** @type {Error} */ (err)?.message) console.error(`Details: ${/** @type {Error} */ (err).message}`);
     process.exit(1);
   }
 }
@@ -1985,8 +1992,8 @@ async function autoRedeemCommand() {
   if (arg === undefined) {
     console.log(`Automatic reset redemption: ${current ? 'on' : 'off'}`);
     console.log('Set with: teamclaude autoredeem <on|off>');
-    console.log('On: when a spent weekly window leaves no Codex account able to serve a request,');
-    console.log('the server spends ONE banked reset credit (the one expiring soonest) and retries.');
+    console.log('On: when no Codex account, or no Claude account, can serve a request, the server');
+    console.log('spends ONE banked reset of that provider and retries the request.');
     return;
   }
   let next;
@@ -1996,10 +2003,10 @@ async function autoRedeemCommand() {
     console.error('Usage: teamclaude autoredeem <on|off>');
     process.exit(1);
   }
-  if (next !== current) await atomicConfigUpdate(c => { c.autoRedeemResets = next; });
+  if (next !== current) await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { c.autoRedeemResets = next; });
   console.log(next
-    ? 'Automatic reset redemption on: a credit is spent only when no Codex account can serve a request.'
-    : 'Automatic reset redemption off: credits are spent only by `teamclaude redeem <account>`.');
+    ? 'Automatic reset redemption on (Codex and Claude): one reset is spent only when no account of that provider can serve a request.'
+    : 'Automatic reset redemption off: resets are spent only by `teamclaude redeem <account>`.');
   await notifyRunningServer(config);
 }
 
@@ -3166,11 +3173,11 @@ Commands:
                       TUI does); with no NAME, list accounts and mark the current
                       --session [ID] moves only that session ($CLAUDE_CODE_SESSION_ID
                       by default); --session --clear drops its pin
-  redeem <name>       Spend ONE of a Codex account's banked rate-limit reset
-                      credits (as '/usage' -> 'Redeem reset' in a signed-in
-                      Codex client); the running server does the spending
-  autoredeem [on|off] Let the server spend one such credit by itself whenever
-                      no Codex account can serve a request (off by default)
+  redeem <name>       Spend ONE banked reset on a Claude or Codex account (as
+                      /limit-reset in Claude Code, or '/usage' -> 'Redeem reset'
+                      in Codex); the running server does the spending
+  autoredeem [on|off] Let the server spend one such reset by itself whenever no
+                      account of a provider can serve a request (off by default)
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)

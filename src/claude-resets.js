@@ -286,11 +286,29 @@ export class ClaudeResetRedeemer {
   }
 
   /**
+   * Spend ONE reset on `account` because an operator named it — the path behind
+   * `teamclaude redeem <account>`. No switch and no policy: naming the account
+   * is the decision, and a grant that needs a limit is refused upstream with
+   * `not_limited`, spending nothing. The call's own safeguards still apply:
+   * fresh status, `next_grant_id` only, request id replayed after an unread
+   * answer, and the automatic path holding off afterwards.
+   *
    * @param {Record<string, any>} account
-   * @param {number} deadline
    * @returns {Promise<ClaudeRedeemResult>}
    */
-  async _redeem(account, deadline) {
+  async redeemOnRequest(account) {
+    if (!this._isClaude(account)) return { redeemed: false, reason: 'not a Claude subscription account' };
+    if (!account.orgUuid) return { redeemed: false, reason: 'no organization id on this account (re-run teamclaude login for it)' };
+    return this._redeem(account, this.now() + Math.max(this.timeoutMs, 30_000), { requireLimit: false });
+  }
+
+  /**
+   * @param {Record<string, any>} account
+   * @param {number} deadline
+   * @param {{ requireLimit?: boolean }} [opts]  false only for an operator's request
+   * @returns {Promise<ClaudeRedeemResult>}
+   */
+  async _redeem(account, deadline, { requireLimit = true } = {}) {
     const name = safeLine(account.name, 64);
     const state = this._stateFor(account);
     const now = this.now();
@@ -313,7 +331,7 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: 'holds no usable reset' };
     }
-    {
+    if (requireLimit) {
       if (!status.atLimit || !status.exhausted.length) {
         state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
         return { redeemed: false, account: name, reason: 'not at a usage limit' };
@@ -340,7 +358,7 @@ export class ClaudeResetRedeemer {
     }
     if (state.grantId !== grant.id) { state.grantId = grant.id; state.requestId = null; }
     state.requestId ||= randomUUID();
-    this.log(`[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" — no Claude account can serve the request`);
+    this.log(`[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" — ${requireLimit ? 'no Claude account can serve the request' : 'requested by an operator'}`);
     const r = await this.claimFn(account, { grantId: grant.id, requestId: state.requestId }, { timeoutMs: left() });
 
     if (r?.error) {
@@ -358,7 +376,7 @@ export class ClaudeResetRedeemer {
       this._holdFleet(account, now + SUCCESS_HOLD_MS);
       this.log(`[TeamClaude] Redeemed a Claude usage-limit reset on "${name}" — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
       await this._reapply(account, deadline);
-      return { redeemed: true, account: name, reason: 'no Claude account could serve the request', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
+      return { redeemed: true, account: name, reason: requireLimit ? 'no Claude account could serve the request' : 'requested by an operator', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
     }
     state.cooldownUntil = r.result === 'cooldown' && r.cooldownUntil ? r.cooldownUntil : now + DECLINED_COOLDOWN_MS;
     this.log(`[TeamClaude] Claude reset on "${name}" declined upstream (${r.result || 'no result'}${r.reason ? `: ${r.reason}` : ''}); nothing was spent`);

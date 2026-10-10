@@ -253,3 +253,30 @@ test('without the hook nothing changes', async () => {
   assert.notEqual(r.status, 200);
   assert.equal(r.hits, 0);
 });
+
+// ── manual (`teamclaude redeem <account>`) ──────────────────────────────────
+
+test('an operator request needs no switch and no limit, but still only spends next_grant_id', async () => {
+  const { am, redeemer, calls } = harness({ config: {}, status: () => block({ at_limit: false, exhausted: [] }) });
+  const r = await redeemer.redeemOnRequest(am.accounts[0]);
+  assert.equal(r.redeemed, true);
+  assert.equal(r.reason, 'requested by an operator');
+  assert.equal(calls.claim.length, 1);
+  const none = harness({ config: {}, status: () => block({ next_grant_id: null }) });
+  assert.match((await none.redeemer.redeemOnRequest(none.am.accounts[0])).reason, /no usable reset/);
+});
+
+test('a Codex row, a third-party backend, or an account with no org id is refused before any request', async () => {
+  const { am, redeemer, calls } = harness({ accounts: [oauth('cx', { provider: 'codex', accountId: 'x' }), oauth('nano', { upstream: 'https://api.nano-gpt.com/api' }), oauth('noorg', { orgUuid: null })] });
+  assert.match((await redeemer.redeemOnRequest(am.accounts[0])).reason, /not a Claude subscription account/);
+  assert.match((await redeemer.redeemOnRequest(am.accounts[1])).reason, /not a Claude subscription account/);
+  assert.match((await redeemer.redeemOnRequest(am.accounts[2])).reason, /no organization id/);
+  assert.equal(calls.status + calls.claim.length, 0);
+});
+
+test('after an operator redeems, the automatic path holds off', async () => {
+  const { am, redeemer, calls } = harness({ accounts: [oauth('a'), oauth('b')] });
+  assert.equal((await redeemer.redeemOnRequest(am.accounts[0])).redeemed, true);
+  assert.match((await redeemer.maybeRedeemForPool(am.accounts)).reason, /holding off/);
+  assert.equal(calls.claim.length, 1);
+});
