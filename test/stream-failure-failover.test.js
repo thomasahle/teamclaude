@@ -76,7 +76,7 @@ const claudeAccount = (name, port) => ({
 // A fleet of `names` accounts in front of one upstream. `handler(acct, res, seen)`
 // answers each upstream request; `seen` is the order accounts were spent in,
 // by the ChatGPT-Account-Id (Codex) or bearer token (Anthropic) the proxy sent.
-async function withFleet(names, handler, fn, { provider = 'codex' } = {}) {
+async function withFleet(names, handler, fn, { provider = 'codex', distributeSessions = false } = {}) {
   /** @type {string[]} */
   const seen = [];
   const upstream = http.createServer(async (req, res) => {
@@ -89,7 +89,7 @@ async function withFleet(names, handler, fn, { provider = 'codex' } = {}) {
   });
   const upstreamPort = await listen(upstream);
   const make = provider === 'codex' ? codexAccount : claudeAccount;
-  const am = new AccountManager(names.map(n => make(n, upstreamPort)), 0.98);
+  const am = new AccountManager(names.map(n => make(n, upstreamPort)), 0.98, { distributeSessions });
   const proxy = createProxyServer(am, { proxy: {} });
   const proxyPort = await listen(proxy);
   try { await fn({ am, proxyPort, seen }); } finally { proxy.close(); upstream.close(); }
@@ -133,19 +133,66 @@ test('a refusal reported inside a 200 stream hops once to a sibling', async () =
   });
 });
 
-// (b) One hop, not a walk of the fleet: a second account refusing the same way
-// is the provider talking, and every further attempt would only spend another
-// account's cache to learn it. The last stream is relayed as upstream sent it.
-test('a refusal every account shares is relayed after exactly one hop', async () => {
-  await withFleet(['one', 'two', 'three'], (acct, res) => {
+// (b) A bounded walk, not the whole fleet: the refusal is per account (four of
+// fourteen refused all day while their siblings served), so a second refusing
+// account is not yet the provider talking. Three hops reach past a pair of
+// throttled accounts; past that every further attempt would only spend another
+// account's cache. The last stream is relayed as upstream sent it.
+test('a refusal every account shares is relayed after at most three hops', async () => {
+  await withFleet(['one', 'two', 'three', 'four', 'five', 'six'], (acct, res) => {
     sseHead(res);
     res.end(sse(CREATED, OVERLOADED, FAILED));
   }, async ({ proxyPort, seen }) => {
     const { status, body } = await codexPost(proxyPort);
     assert.equal(status, 200, 'upstream answered 200, and that is what the client gets');
-    assert.equal(seen.length, 2, 'two attempts, not one per account');
-    assert.equal(body, sse(CREATED, OVERLOADED, FAILED), "the second refusal is relayed byte for byte, not hidden");
+    assert.equal(seen.length, 4, 'the first attempt and three hops, not one per account');
+    assert.equal(new Set(seen).size, 4, 'every hop went to an account not yet spent');
+    assert.equal(body, sse(CREATED, OVERLOADED, FAILED), "the last refusal is relayed byte for byte, not hidden");
   });
+});
+
+// (b2) Two throttled accounts in a row, a third that serves: the client reads
+// the third's stream, and, with session distribution on, the conversation now
+// lives there — each hop's attempt records the session on its destination, so
+// its next request goes straight to the account that served, not back to the
+// one that refused.
+test('two refusing accounts are hopped past, and the session re-pins on the one that served', async () => {
+  await withFleet(['one', 'two', 'three'], (acct, res, seen) => {
+    sseHead(res);
+    const refusing = new Set(seen.slice(0, 2));
+    if (refusing.has(acct) && seen.length <= 3) return res.end(sse(CREATED, OVERLOADED, FAILED));
+    res.end(sse(CREATED, IN_PROGRESS, DELTA, COMPLETED));
+  }, async ({ proxyPort, seen }) => {
+    const first = await codexPost(proxyPort);
+    assert.equal(first.status, 200);
+    assert.equal(seen.length, 3, 'two hops: two refusing accounts, then the one that served');
+    assert.equal(new Set(seen).size, 3);
+    assert.equal(first.body, sse(CREATED, IN_PROGRESS, DELTA, COMPLETED), "the client reads the third account's stream");
+    const served = seen[2];
+    const second = await codexPost(proxyPort);
+    assert.equal(second.status, 200);
+    assert.equal(seen.length, 4, 'the next request of the same session took no hop');
+    assert.equal(seen[3], served, 'the session is pinned to the account that served it');
+  }, { distributeSessions: 'load' });
+});
+
+// (b3) The walk is operator-bounded: TEAMCLAUDE_STREAM_FAILURE_MAX_HOPS=0
+// restores a plain relay, 1 the single hop.
+test('TEAMCLAUDE_STREAM_FAILURE_MAX_HOPS bounds the walk', async () => {
+  for (const [hops, attempts] of [['0', 1], ['1', 2]]) {
+    process.env.TEAMCLAUDE_STREAM_FAILURE_MAX_HOPS = hops;
+    try {
+      await withFleet(['one', 'two', 'three'], (acct, res) => {
+        sseHead(res);
+        res.end(sse(CREATED, OVERLOADED, FAILED));
+      }, async ({ proxyPort, seen }) => {
+        await codexPost(proxyPort);
+        assert.equal(seen.length, attempts, `max hops ${hops} means ${attempts} attempt(s)`);
+      });
+    } finally {
+      delete process.env.TEAMCLAUDE_STREAM_FAILURE_MAX_HOPS;
+    }
+  }
 });
 
 // (c) Order decides, not presence. A failure that follows a delta is a stream

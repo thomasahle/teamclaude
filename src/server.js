@@ -2786,11 +2786,24 @@ export const STREAM_FAILURE_CODES = new Set(['server_is_overloaded', 'server_err
 
 // How much of a stream the peek may hold before releasing it undecided. The
 // Codex lifecycle envelopes echo the whole request back, instructions included,
-// so `response.created` alone can run to tens of KiB.
-const DEFAULT_STREAM_PEEK_BUDGET_BYTES = 256 * 1024;
+// so `response.created` alone carries the request's whole context: a coding
+// agent turn with 100k tokens of history echoes about a megabyte before the
+// first decisive event. At 256 KiB the peek released nearly every refusal of a
+// 27-session fleet undecided (vip-ng, 2026-10-20: 1,119 "at capacity" refusals
+// relayed in one day, not one hop taken), so the budget is sized for the echo.
+// Memory cost is at most this much per in-flight streaming request.
+const DEFAULT_STREAM_PEEK_BUDGET_BYTES = 16 * 1024 * 1024;
 // How long the peek may hold the headers back. A slow first token is not a
 // failure, and a stream that says nothing is released rather than waited on.
 const DEFAULT_STREAM_PEEK_HOLD_MS = 10_000;
+// How many siblings one request may hop to after in-band refusals. The refusal
+// is per account, not per provider: on a 14-account Codex pool four accounts
+// returned "at capacity" all day while their siblings served the same model
+// without one refusal (vip-ng, 2026-10-20). One hop therefore often lands on a
+// second refusing account and relays the refusal; three bounds the walk while
+// reaching past a pair of throttled accounts. Each hop spends one more
+// account's cache on the same turn, which is why it is not the whole fleet.
+const DEFAULT_STREAM_FAILURE_MAX_HOPS = 3;
 
 /**
  * The peek's two bounds. Read per call like the body idle timeout, so a test
@@ -2806,6 +2819,18 @@ export function resolveStreamPeekBounds() {
     budgetBytes: budget > 0 ? budget : DEFAULT_STREAM_PEEK_BUDGET_BYTES,
     holdMs: hold > 0 ? hold : DEFAULT_STREAM_PEEK_HOLD_MS,
   };
+}
+
+/**
+ * How many in-band refusal hops one request may take, read per call so a test
+ * can set TEAMCLAUDE_STREAM_FAILURE_MAX_HOPS. Unset, empty or negative means
+ * the default; 0 disables the hop.
+ * @returns {number}
+ */
+export function resolveStreamFailureMaxHops() {
+  const raw = envVar('STREAM_FAILURE_MAX_HOPS');
+  const n = Number(raw);
+  return raw !== undefined && raw !== '' && Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_STREAM_FAILURE_MAX_HOPS;
 }
 
 // What the wall clock resolves to when it beats a read.
@@ -2914,8 +2939,14 @@ export async function peekStreamFailure(stream, bounds = {}) {
     pending = null;
   }
 
+  // Why the peek stopped, for the caller's log: a budget release means the
+  // refusal, if there was one, is about to be relayed because the echo was
+  // larger than the hold, and the operator can raise the budget.
+  const released = verdict.decided ? 'decided' : ended ? 'ended' : held >= budgetBytes ? 'budget' : 'hold';
   return {
     failureCode: verdict.failureCode,
+    released,
+    heldBytes: held,
     body: new ReadableStream({
       start(controller) {
         for (const chunk of chunks) controller.enqueue(chunk);
@@ -3779,8 +3810,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // way is the provider talking, not the account — keyed on the first
     // decisive event instead of the status. The sibling is picked first so a
     // request with nowhere to hop to is never held for nothing.
+    // Bounded by resolveStreamFailureMaxHops, counted on ctx across the
+    // attempts of one client request.
     if (isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
-        && !ctx.streamFailureHopped && retryCount < maxRetries) {
+        && (ctx.streamFailureHops ?? 0) < resolveStreamFailureMaxHops() && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
         ctx.model, ctx.advisorModel, ctx.provider,
@@ -3788,12 +3821,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (alt && !accountManager.isPaused(alt.index)) {
         const peeked = await peekStreamFailure(upstreamBody);
         upstreamBody = peeked.body;
+        if (peeked.released === 'budget') {
+          console.log(`[TeamClaude] Stream peek on "${account.name}" released undecided after ${peeked.heldBytes} bytes — the lifecycle echo is larger than TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES; a refusal in it will be relayed`);
+        }
         if (peeked.failureCode && !accountManager.isPaused(alt.index)) {
           await peeked.cancel();
-          ctx.streamFailureHopped = true;
+          ctx.streamFailureHops = (ctx.streamFailureHops ?? 0) + 1;
           ctx.hopTo = alt.index;
           ctx.tried.add(account.index);
-          console.log(`[TeamClaude] Stream failed inside a ${upstreamRes.status} on "${account.name}" (${peeked.failureCode}) — failing over once to "${alt.name}"`);
+          console.log(`[TeamClaude] Stream failed inside a ${upstreamRes.status} on "${account.name}" (${peeked.failureCode}) — failing over to "${alt.name}" (hop ${ctx.streamFailureHops} of ${resolveStreamFailureMaxHops()})`);
           if (clientGone(res)) { ctx.abandoned = true; return; }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
         }
