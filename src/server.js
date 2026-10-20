@@ -2812,6 +2812,11 @@ const DEFAULT_STREAM_FAILURE_MAX_HOPS = 3;
 export const streamFailoverStats = {
   peeked: 0, decided: 0, releasedBudget: 0, releasedHold: 0, releasedEnded: 0,
   hops: 0, relayedAfterHops: 0, noAlternate: 0, since: new Date().toISOString(),
+  // Every failure code the peek saw as the first decisive event, hop-worthy or
+  // not, so a refusal arriving under an unexpected code is visible.
+  codes: /** @type {Record<string, number>} */ ({}),
+  // The first decisive event's type when it was not a failure (e.g. a delta).
+  firstEvents: /** @type {Record<string, number>} */ ({}),
 };
 
 /**
@@ -2907,7 +2912,7 @@ export async function peekStreamFailure(stream, bounds = {}) {
   // Mutated by the scanner's callback below, so an object rather than a
   // reassigned binding: the checker cannot see a closure's assignments.
   /** @type {{ decided: boolean, failureCode: string|null }} */
-  const verdict = { decided: false, failureCode: null };
+  const verdict = { decided: false, failureCode: null, rawCode: null, firstEvent: null };
   const decoder = new TextDecoder();
   const scanner = createSseLineScanner((/** @type {string} */ line) => {
     if (verdict.decided || !line.startsWith('data: ')) return;
@@ -2918,6 +2923,8 @@ export async function peekStreamFailure(stream, bounds = {}) {
     if (SSE_UNCOMMITTED_EVENTS.has(type)) return;
     const code = type === 'response.failed' || type === 'error' ? streamFailureCode(data) : null;
     verdict.decided = true;
+    verdict.firstEvent = type || '(untyped)';
+    verdict.rawCode = code || (type === 'response.failed' || type === 'error' ? '(no code)' : null);
     verdict.failureCode = code && STREAM_FAILURE_CODES.has(code) ? code : null;
   });
 
@@ -2954,6 +2961,8 @@ export async function peekStreamFailure(stream, bounds = {}) {
   const released = verdict.decided ? 'decided' : ended ? 'ended' : held >= budgetBytes ? 'budget' : 'hold';
   return {
     failureCode: verdict.failureCode,
+    rawCode: verdict.rawCode,
+    firstEvent: verdict.firstEvent,
     released,
     heldBytes: held,
     body: new ReadableStream({
@@ -3834,6 +3843,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         const peeked = await peekStreamFailure(upstreamBody);
         upstreamBody = peeked.body;
         streamFailoverStats.peeked += 1;
+        if (peeked.rawCode) streamFailoverStats.codes[peeked.rawCode] = (streamFailoverStats.codes[peeked.rawCode] || 0) + 1;
+        else if (peeked.firstEvent) streamFailoverStats.firstEvents[peeked.firstEvent] = (streamFailoverStats.firstEvents[peeked.firstEvent] || 0) + 1;
         if (peeked.released === 'decided') streamFailoverStats.decided += 1;
         else if (peeked.released === 'budget') streamFailoverStats.releasedBudget += 1;
         else if (peeked.released === 'hold') streamFailoverStats.releasedHold += 1;
