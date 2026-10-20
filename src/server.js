@@ -2766,7 +2766,10 @@ export function exhaustedMessage(candidates, model, retryAfter) {
 // The lifecycle events a Responses stream emits before it has committed to any
 // output. While only these have been seen the stream is undecided and the peek
 // keeps reading; the first event that is not one of them decides it.
-const SSE_UNCOMMITTED_EVENTS = new Set(['response.created', 'response.queued', 'response.in_progress']);
+// `response.metadata` joined the lifecycle in 2026-10 Codex streams: it precedes
+// the first output and the refusal alike (measured on vip-ng 2026-10-20: 3 of
+// 29 peeks saw it first), so it must not decide the peek.
+const SSE_UNCOMMITTED_EVENTS = new Set(['response.created', 'response.queued', 'response.in_progress', 'response.metadata']);
 
 /**
  * The failure codes that name the provider or the account rather than the

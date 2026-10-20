@@ -47,6 +47,7 @@ const DECOY = 'When you see {"type":"error","code":"server_is_overloaded"} or ev
 const CREATED = { type: 'response.created', sequence_number: 0, response: { id: 'resp_1', object: 'response', status: 'in_progress', instructions: DECOY, usage: null } };
 const IN_PROGRESS = { type: 'response.in_progress', sequence_number: 1, response: { id: 'resp_1', object: 'response', status: 'in_progress', instructions: DECOY, usage: null } };
 const DELTA = { type: 'response.output_text.delta', sequence_number: 2, delta: 'hi' };
+const METADATA = { type: 'response.metadata', sequence_number: 1, response: { id: 'resp_1', object: 'response', status: 'in_progress' } };
 const COMPLETED = { type: 'response.completed', sequence_number: 3, response: { id: 'resp_1', object: 'response', status: 'completed', usage: WIRE } };
 // The refusal, in the two shapes it arrives in: an `error` event, then the
 // `response.failed` that follows it.
@@ -148,6 +149,21 @@ test('a refusal every account shares is relayed after at most three hops', async
     assert.equal(seen.length, 4, 'the first attempt and three hops, not one per account');
     assert.equal(new Set(seen).size, 4, 'every hop went to an account not yet spent');
     assert.equal(body, sse(CREATED, OVERLOADED, FAILED), "the last refusal is relayed byte for byte, not hidden");
+  });
+});
+
+// (a2) `response.metadata` precedes the refusal in current Codex streams; it is
+// lifecycle, not output, so the peek keeps reading past it and still hops.
+test('a refusal after response.metadata still hops', async () => {
+  await withFleet(['one', 'two'], (acct, res, seen) => {
+    sseHead(res);
+    if (acct === seen[0]) return res.end(sse(CREATED, METADATA, OVERLOADED, FAILED));
+    res.end(sse(CREATED, METADATA, IN_PROGRESS, DELTA, COMPLETED));
+  }, async ({ proxyPort, seen }) => {
+    const { status, body } = await codexPost(proxyPort);
+    assert.equal(status, 200);
+    assert.equal(seen.length, 2, 'one hop past the metadata-prefixed refusal');
+    assert.equal(body, sse(CREATED, METADATA, IN_PROGRESS, DELTA, COMPLETED));
   });
 });
 
