@@ -609,7 +609,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus(), streamFailover: { ...streamFailoverStats } }, null, 2));
         return;
       }
 
@@ -2805,6 +2805,15 @@ const DEFAULT_STREAM_PEEK_HOLD_MS = 10_000;
 // account's cache on the same turn, which is why it is not the whole fleet.
 const DEFAULT_STREAM_FAILURE_MAX_HOPS = 3;
 
+// Counters for the operator: how often the peek decided, released by budget,
+// hold or end of stream, and how many hops were taken or exhausted. Reported in
+// /teamclaude/status as `streamFailover`, since the TUI's activity pane keeps
+// the log lines only briefly.
+export const streamFailoverStats = {
+  peeked: 0, decided: 0, releasedBudget: 0, releasedHold: 0, releasedEnded: 0,
+  hops: 0, relayedAfterHops: 0, noAlternate: 0, since: new Date().toISOString(),
+};
+
 /**
  * The peek's two bounds. Read per call like the body idle timeout, so a test
  * can shrink them through TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES and
@@ -3813,20 +3822,30 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Bounded by resolveStreamFailureMaxHops, counted on ctx across the
     // attempts of one client request.
     if (isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
+        && (ctx.streamFailureHops ?? 0) >= resolveStreamFailureMaxHops()) streamFailoverStats.relayedAfterHops += 1;
+    if (isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && (ctx.streamFailureHops ?? 0) < resolveStreamFailureMaxHops() && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
         ctx.model, ctx.advisorModel, ctx.provider,
       );
+      if (!alt || accountManager.isPaused(alt.index)) streamFailoverStats.noAlternate += 1;
       if (alt && !accountManager.isPaused(alt.index)) {
         const peeked = await peekStreamFailure(upstreamBody);
         upstreamBody = peeked.body;
+        streamFailoverStats.peeked += 1;
+        if (peeked.released === 'decided') streamFailoverStats.decided += 1;
+        else if (peeked.released === 'budget') streamFailoverStats.releasedBudget += 1;
+        else if (peeked.released === 'hold') streamFailoverStats.releasedHold += 1;
+        else streamFailoverStats.releasedEnded += 1;
         if (peeked.released === 'budget') {
           console.log(`[TeamClaude] Stream peek on "${account.name}" released undecided after ${peeked.heldBytes} bytes — the lifecycle echo is larger than TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES; a refusal in it will be relayed`);
         }
+        if (peeked.failureCode && accountManager.isPaused(alt.index)) streamFailoverStats.noAlternate += 1;
         if (peeked.failureCode && !accountManager.isPaused(alt.index)) {
           await peeked.cancel();
           ctx.streamFailureHops = (ctx.streamFailureHops ?? 0) + 1;
+          streamFailoverStats.hops += 1;
           ctx.hopTo = alt.index;
           ctx.tried.add(account.index);
           console.log(`[TeamClaude] Stream failed inside a ${upstreamRes.status} on "${account.name}" (${peeked.failureCode}) — failing over to "${alt.name}" (hop ${ctx.streamFailureHops} of ${resolveStreamFailureMaxHops()})`);
