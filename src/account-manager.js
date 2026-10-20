@@ -1407,7 +1407,16 @@ export class AccountManager {
     // this one request and not the fleet.
     const reach = advisorModel && this.advisorEligibility === 'prefer'
       ? this._advisorReach(excluded, model, advisorModel) : null;
-    const normal = this._pickBestAvailable(excluded, model, reach && reach.eligible < reach.of ? null : advisorModel);
+    const advisorForPick = reach && reach.eligible < reach.of ? null : advisorModel;
+    // With session distribution on, a hop is also a placement: the session
+    // re-pins where the hop lands (recordSession on the retried attempt). The
+    // priority/pressure/reset walk is deterministic, so every session hopping
+    // off a throttled account landed on the same sibling — measured on vip-ng
+    // 2026-10-20: 50 hops in 50 minutes put 14 of 22 sessions and 71% of the
+    // requests on one account. The least-loaded walk spreads them as placement
+    // would; the best-available walk remains the fallback and the off-mode pick.
+    const normal = (this.distributionMode !== 'off' && this._pickLeastLoaded(excluded, model, advisorForPick))
+      || this._pickBestAvailable(excluded, model, advisorForPick);
     if (normal) return normal;
     const pick = this._pickFallback(excluded, model, provider);
     if (!pick) return null;

@@ -192,6 +192,27 @@ test('two refusing accounts are hopped past, and the session re-pins on the one 
   }, { distributeSessions: 'load' });
 });
 
+// (b4) With distribution on, the hop's destination is a placement: the least
+// loaded sibling, not the deterministic best-available walk that sent every
+// hopping session to the same account.
+test('with load distribution the hop lands on the least loaded sibling', async () => {
+  await withFleet(['one', 'two', 'three'], (acct, res) => {
+    sseHead(res);
+    if (acct === 'one') return res.end(sse(CREATED, OVERLOADED, FAILED));
+    res.end(sse(CREATED, IN_PROGRESS, DELTA, COMPLETED));
+  }, async ({ am, proxyPort, seen }) => {
+    // Five requests from another session, all served by "two": it now carries
+    // the most recent load of the three.
+    const two = byName(am, 'two');
+    for (let i = 0; i < 5; i++) am.recordSession('sess-busy', two.index, MODEL);
+    const { status } = await codexPost(proxyPort);
+    assert.equal(status, 200);
+    assert.equal(seen[0], 'one', 'placed on an idle account, which refuses');
+    assert.equal(seen[1], 'three', 'the hop goes to the idle sibling, not the loaded one');
+    assert.equal(seen.length, 2);
+  }, { distributeSessions: 'load' });
+});
+
 // (b3) The walk is operator-bounded: TEAMCLAUDE_STREAM_FAILURE_MAX_HOPS=0
 // restores a plain relay, 1 the single hop.
 test('TEAMCLAUDE_STREAM_FAILURE_MAX_HOPS bounds the walk', async () => {
