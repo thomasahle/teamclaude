@@ -1,0 +1,1646 @@
+// The status dashboard: a single self-contained HTML page served at
+// GET /teamclaude/dashboard, rendering /teamclaude/status for humans.
+//
+// The page itself contains NO data — it is a static asset whose script fetches
+// /teamclaude/status (same origin) with the proxy key and re-renders every few
+// seconds. That split is what lets the asset be served without the key (a
+// browser address bar cannot send x-api-key) while every byte of actual status
+// stays behind the existing gate. The key is asked for only when the server
+// refuses the page without one (401/403; loopback browsers are exempt), and is
+// kept in localStorage; a later refusal (wrong or rotated key) asks again.
+//
+// Self-contained on purpose: no external scripts, styles, or fonts, so the
+// page works on air-gapped deployments and adds no third-party surface. All
+// rendering uses textContent — status fields (account names, client names) are
+// operator/OAuth-derived, but they still never reach innerHTML.
+
+import { createHash } from 'node:crypto';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow } from './status-renderer.js';
+import { USAGE_WINDOWS } from './client-usage.js';
+
+export function renderDashboardHtml() {
+  return PAGE;
+}
+
+/**
+ * The body of every `<script>` in the page, in order. Attribute-free tags only,
+ * which is all this page has and all the hash policy can admit anyway.
+ *
+ * @param {string} html
+ */
+export function inlineScripts(html) {
+  const out = [];
+  const re = /<script>([\s\S]*?)<\/script>/g;
+  let m;
+  while ((m = re.exec(html)) !== null) out.push(m[1]);
+  return out;
+}
+
+/**
+ * Content-Security-Policy for the dashboard, sent by the server with the page.
+ *
+ * The page holds the proxy key in localStorage, so the policy is the backstop
+ * for a script that should never run there: nothing loads from anywhere
+ * (`default-src 'none'`), each inline script (the theme bootstrap in `<head>`
+ * and the main script) is admitted by its hash rather than by
+ * `'unsafe-inline'` — the page is static, so the hashes are stable — and the
+ * only network the script may touch is this origin, for status and switch.
+ * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
+ * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
+ * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
+ * another site's iframe, where a click on "switch" could be overlaid.
+ */
+export function dashboardCsp(html = PAGE) {
+  // Every inline script, not just the first: the theme is applied by a short
+  // script in <head> so the page does not paint dark and then flip to light,
+  // and a hash that covered only the main script would leave that one blocked.
+  const hashes = inlineScripts(html)
+    .map(script => `'sha256-${createHash('sha256').update(script, 'utf8').digest('base64')}'`)
+    .join(' ');
+  return [
+    "default-src 'none'",
+    `script-src ${hashes}`,
+    "style-src 'unsafe-inline'",
+    "connect-src 'self'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join('; ');
+}
+
+// The page's pure logic lives here, not in the script string: these functions
+// close over nothing and touch no DOM, so they are serialized into the page
+// with toString() below AND exported for the test suite. One implementation,
+// tested and served — a test against the string would only be a source grep.
+
+// Model-scoped weekly buckets, one row per family upstream actually metered.
+// `scopedWeekly` is learned from the usage payload's `limits` array, so it is
+// the complete list when present; the two dedicated fields are the fallback for
+// a payload that reported `seven_day_sonnet` without a `limits` array.
+export function scopedWeeklyRows(quota) {
+  var q = quota || {};
+  var scoped = q.scopedWeekly || {};
+  var rows = [];
+  Object.keys(scoped).forEach(function (family) {
+    var b = scoped[family] || {};
+    rows.push({ family: family, label: family.charAt(0).toUpperCase() + family.slice(1), utilization: b.utilization, resetAt: b.resetAt });
+  });
+  [{ family: 'fable', label: 'Fable', u: q.unified7dFable, r: q.unified7dFableReset },
+    { family: 'sonnet', label: 'Sonnet', u: q.unified7dSonnet, r: q.unified7dSonnetReset }].forEach(function (f) {
+    if (Object.prototype.hasOwnProperty.call(scoped, f.family) || f.u == null) return;
+    rows.push({ family: f.family, label: f.label, utilization: f.u, resetAt: f.r });
+  });
+  rows.sort(function (a, b) { return a.family < b.family ? -1 : a.family > b.family ? 1 : 0; });
+  return rows;
+}
+
+// The rows a third-party backend's own reading draws on its card (#530). The
+// probe stores it as `quota.backend` (backend-quota.js): per-window fractions
+// when the provider reports distinct windows, else one fraction, else text
+// alone. A window past its reset is left out — the reading predates the reset,
+// so its fraction no longer describes anything. `text` is what is left to say
+// when no bar can be drawn: a balance has no fraction to fill a bar with.
+/** @param {any} backend @param {number} [now] */
+export function backendQuotaRows(backend, now) {
+  var b = backend || {};
+  var at = now == null ? Date.now() : now;
+  var w = b.windows || {};
+  var rows = [];
+  [{ key: 'fiveHour', label: 'Session' }, { key: 'weekly', label: 'Weekly' }, { key: 'monthly', label: 'Monthly' }].forEach(function (d) {
+    var win = w[d.key];
+    if (!win || win.utilization == null) return;
+    if (win.resetAt != null && win.resetAt <= at) return;
+    rows.push({ label: d.label, utilization: win.utilization, resetAt: win.resetAt == null ? null : win.resetAt });
+  });
+  if (!rows.length && b.utilization != null) rows.push({ label: b.label || 'Quota', utilization: b.utilization, resetAt: null });
+  return { rows: rows, text: !rows.length && b.text ? (b.label || 'Quota') + ': ' + b.text : null };
+}
+
+// What an account has spent, cache included. `totalInputTokens` counts uncached
+// input only, which on Claude Code traffic is ~0.05% of the input side — a
+// total without the cache fields understates the account by orders of magnitude.
+export function accountTokens(usage) {
+  var u = usage || {};
+  return (u.totalInputTokens || 0) + (u.totalOutputTokens || 0)
+    + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
+}
+
+// A model id as a person would say it: claude-opus-5-5 -> "Opus 5.5",
+// claude-haiku-4-5-20251001 -> "Haiku 4.5", gpt-6.1-sol -> "GPT 6.1 Sol".
+// A context suffix ("[1m]") is dropped; any other shape is shown as sent.
+export function modelLabel(/** @type {string} */ id) {
+  var s = String(id);
+  var br = s.indexOf('[');
+  if (br > 0) s = s.slice(0, br);
+  var parts = s.split('-');
+  var isNum = function (/** @type {string} */ p) { return p !== '' && !isNaN(Number(p)); };
+  var cap = function (/** @type {string} */ w) { return w.charAt(0).toUpperCase() + w.slice(1); };
+  if (parts[0] === 'claude' && parts.length >= 3) {
+    // Date stamps (8 digits) are a snapshot id, not part of the version.
+    var nums = parts.slice(2).filter(function (p) { return isNum(p) && p.length < 8; });
+    if (nums.length) return cap(parts[1]) + ' ' + nums.slice(0, 2).join('.');
+  }
+  if (parts[0] === 'gpt' && parts.length >= 2) {
+    return 'GPT ' + parts[1] + (parts.length > 2 ? ' ' + parts.slice(2).map(cap).join(' ') : '');
+  }
+  return s;
+}
+
+// The models an account served in the last 15 minutes, newest first, at most
+// three. Haiku is what Claude Code uses for side requests (titles, summaries),
+// so it is listed only when nothing else ran — otherwise it would crowd out
+// the model the sessions on that account are actually working with.
+export function recentModelLabels(/** @type {any} */ usage, /** @type {number} */ now) {
+  /** @type {Record<string, number>} */
+  var seen = (usage && usage.recentModels) || {};
+  var at = now == null ? Date.now() : now;
+  var ids = Object.keys(seen).filter(function (k) { return at - seen[k] < 15 * 60 * 1000; })
+    .sort(function (x, y) { return seen[y] - seen[x]; });
+  var main = ids.filter(function (k) { return k.toLowerCase().indexOf('haiku') < 0; });
+  return (main.length ? main : ids).slice(0, 3).map(modelLabel);
+}
+
+export function providerLabel(provider) {
+  if (provider === 'codex') return 'Codex';
+  if (provider === 'anthropic') return 'Claude';
+  return provider || 'Unknown';
+}
+
+// Every bucket switchThreshold can be keyed by, plus the short names the
+// threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS in model.js
+// and THRESHOLD_BUCKET_LABELS in status-renderer.js — duplicated rather than
+// imported, because the browser never runs an import. It does not see this
+// module's scope either: a helper reaches the page as its own source text, so
+// these two are written into the page by SHARED_CONSTS below. Without that the
+// first table-form override throws a ReferenceError inside render() and takes
+// the accounts pane with it.
+export var THRESHOLD_BUCKET_KEYS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+/** @type {Object<string, string>} */
+export var THRESHOLD_BUCKET_LABELS = {
+  unified5h: '5h', unified7d: '7d', unified7dSonnet: 'sonnet', unified7dFable: 'fable',
+  tokens: 'tokens', requests: 'requests',
+};
+
+/**
+ * "switch at 100%" / "switch 7d 90%, fable 80%" — an account's OWN
+ * switchThreshold (issue #409), or '' when it has none or every override it
+ * carries merely repeats what the fleet already resolves to. `fleetThreshold`
+ * and `fleetThresholds` are the status payload's own top-level fields
+ * (`status.switchThreshold` / `status.switchThresholds`), so the comparison
+ * uses the exact fleet value the live server is gating on.
+ * @param {number|Object<string, number>|null|undefined} accountThreshold
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {string}
+ */
+export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresholds) {
+  /** @param {string} bucket */
+  function fleetFor(bucket) {
+    if (fleetThresholds && typeof fleetThresholds === 'object') {
+      var v = fleetThresholds[bucket];
+      if (v == null) v = fleetThresholds.default;
+      if (typeof v === 'number' && isFinite(v)) return v;
+    }
+    return typeof fleetThreshold === 'number' && isFinite(fleetThreshold) ? fleetThreshold : 0.98;
+  }
+  /** @param {number} v */
+  function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
+  /** @param {unknown} v */
+  function valid(v) { return typeof v === 'number' && isFinite(v); }
+  /** @type {string[]} */
+  var parts = [];
+  /** @type {Object<string, any>} */
+  var table = {};
+  /** @type {any} */
+  var ownDefault = null;
+  if (typeof accountThreshold === 'number') {
+    if (!valid(accountThreshold)) return '';
+    ownDefault = accountThreshold;
+    if (accountThreshold !== fleetFor('default')) parts.push('at ' + pct(accountThreshold));
+  } else if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
+    table = accountThreshold;
+    ownDefault = table.default;
+    Object.keys(table).forEach(function (key) {
+      var v = table[key];
+      if (!valid(v)) return;
+      if (key !== 'default' && THRESHOLD_BUCKET_KEYS.indexOf(key) === -1) return;
+      if (v !== fleetFor(key)) parts.push((key === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[key] || key)) + ' ' + pct(v));
+    });
+  }
+  // As switchThresholdDiffs in model.js: the account's own default outranks a
+  // bucket entry in the FLEET table, so a default equal to the fleet's can
+  // still move a bucket the fleet names (fleet 7d at 85%, account 0.98 puts
+  // that account's 7d at 98%). When the defaults differ, "at N%" already
+  // covers every bucket the account does not list.
+  if (valid(ownDefault) && ownDefault === fleetFor('default')) {
+    THRESHOLD_BUCKET_KEYS.forEach(function (key) {
+      if (valid(table[key])) return;
+      if (ownDefault !== fleetFor(key)) parts.push(THRESHOLD_BUCKET_LABELS[key] + ' ' + pct(ownDefault));
+    });
+  }
+  return parts.length ? 'switch ' + parts.join(', ') : '';
+}
+
+/**
+ * `now` keeps the fourth slot master's reset-credit callers already use; the
+ * fleet threshold pair (#409) follows it.
+ * @param {Record<string, any>|null|undefined} account
+ * @param {string|null} [current]
+ * @param {Record<string, string>|null} [currentAccounts]
+ * @param {number|null} [now]  ms epoch a reset-credit reading's age is measured from
+ * @param {number|null|undefined} [fleetThreshold]
+ * @param {Object<string, number>|null|undefined} [fleetThresholds]
+ */
+export function accountBadges(account, current, currentAccounts, now, fleetThreshold, fleetThresholds) {
+  var a = account || {};
+  var isCurrent = currentAccounts
+    ? currentAccounts[a.provider] === a.name
+    : a.name === current;
+  var status = a.disabled ? 'disabled' : (a.status || 'unknown');
+  var recent = Number.isFinite(a.sessions) ? a.sessions : 0;
+  var known = Number.isFinite(a.knownSessions) ? a.knownSessions : 0;
+  var badges = [
+    { cls: 'provider ' + (a.provider || 'unknown'), text: providerLabel(a.provider) },
+    { cls: 'meta', text: a.type || 'unknown' },
+    { cls: 'meta priority', text: 'prio ' + (a.priority || 0) },
+  ];
+  if (isCurrent) badges.push({ cls: 'current', text: 'current' });
+  badges.push({ cls: status, text: status });
+  if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
+  if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
+  // Free Codex rate-limit reset credits this account holds — what it could
+  // spend to undo an exhausted window rather than wait one out. The count is
+  // the account's holdings, not what upstream would apply this instant.
+  // A reading past RESET_CREDIT_MAX_AGE_MS is dropped, as it is on the status
+  // screen and the TUI row: only the usage probe refreshes the count, so an old
+  // one may describe a credit that has since been redeemed or has expired.
+  var reading = (a.quota || {}).resetCredits || {};
+  var credits = reading.available;
+  var at = now == null ? Date.now() : now;
+  var stale = Number.isFinite(reading.seenAt) && at - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
+  // A Claude banked reset states when it lapses: drop it past then, and say
+  // the date while it stands (the claude.ai Resets page names it the same way).
+  var expired = Number.isFinite(reading.expiresAt) && reading.expiresAt <= at;
+  if (Number.isFinite(credits) && credits > 0 && !stale && !expired) {
+    var expires = Number.isFinite(reading.expiresAt)
+      ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+      : '';
+    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
+  }
+  // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
+  // no account switchThreshold at all — the common case — thresholdBadgeText
+  // returns '' regardless of what the fleet args are, so an old caller sees no
+  // new badge. A caller that DOES set switchThreshold on the account is
+  // expected to pass the fleet's own value too, the way `render()` does below,
+  // or the comparison falls back to thresholdBadgeText's own 0.98 default.
+  var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
+  if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
+  // Extra-usage fallback: one badge, the louder state winning. Strict `true`
+  // so a missing field on an older server's payload shows nothing.
+  if (a.onExtraUsage === true) badges.push({ cls: 'extra-usage billing', text: 'on extra usage \u2014 billing' });
+  else if (a.allowExtraUsage === true) badges.push({ cls: 'extra-usage', text: 'extra usage allowed' });
+  // The account's own egress proxy, as the status payload carries it: already
+  // password-masked (describeRouting), and absent for an account on the fleet
+  // path, which is the default and earns no badge.
+  if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
+  return badges;
+}
+
+// One row per CONVERSATION, from `sessions.items` (proxy.sessionDetail). A
+// Claude Code session that fans out to nine subagents is nine rows, because a
+// conversation is what holds a pin and a prompt cache.
+//
+// `id` is the pin key those rows are keyed by — a session id narrowed to one
+// conversation — which is an identity for routing, not one to read: a composite
+// nobody recognises, and identical between siblings but for its tail. So the
+// visible identity is split in two, the session an operator knows and the
+// conversation that tells its siblings apart. A record labelled by no request
+// (touch() alone) has no session name, and falls back to the key it is under.
+//
+// The token columns are #192's numbers — what each response actually reported,
+// cache included — summed across the weekly buckets the conversation touched.
+// `pins` is a bucket→account map rather than one index, because a conversation
+// spending two model families is served by two accounts at the same time.
+export function sessionRows(sessions) {
+  var items = (sessions && sessions.items) || [];
+  return items.map(function (s) {
+    var buckets = s.tokens || {};
+    var row = {
+      id: s.id,
+      session: s.session || s.id || '',
+      // Enough of the digest to separate one session's live conversations; the
+      // whole of it is a column read to the end by nobody.
+      conversation: String(s.conversation || '').slice(0, 8),
+      client: s.client || '',
+      project: (s.dimensions || {}).project || '',
+      active: !!s.active,
+      requests: s.requests || 0,
+      starved: s.starved || 0,
+      cacheRead: 0, cacheCreation: 0, input: 0, output: 0, context: 0,
+      accounts: Object.keys(s.pins || {}).map(function (b) { return s.pins[b]; }).join(', '),
+      lastSeen: s.lastSeen || 0,
+    };
+    Object.keys(buckets).forEach(function (b) {
+      var t = buckets[b] || {};
+      row.cacheRead += t.cacheRead || 0;
+      row.cacheCreation += t.cacheCreation || 0;
+      row.input += t.input || 0;
+      row.output += t.output || 0;
+      row.context += t.context || 0;
+    });
+    row.total = row.cacheRead + row.cacheCreation + row.input + row.output;
+    return row;
+  });
+}
+
+export function filterSessionRows(rows, filters) {
+  var f = filters || {};
+  return (rows || []).filter(function (r) {
+    if (f.project && r.project !== f.project) return false;
+    if (f.client && r.client !== f.client) return false;
+    return true;
+  });
+}
+
+// Text sorts alphabetically, numbers numerically. A missing value sorts as
+// empty/zero rather than dropping the row.
+export function sortRows(rows, key, dir) {
+  var sign = dir === 'asc' ? 1 : -1;
+  return (rows || []).slice().sort(function (a, b) {
+    var x = a[key], y = b[key];
+    if (typeof x === 'string' || typeof y === 'string') {
+      return sign * String(x == null ? '' : x).localeCompare(String(y == null ? '' : y));
+    }
+    return sign * ((x || 0) - (y || 0));
+  });
+}
+
+export function uniqSorted(values) {
+  var seen = Object.create(null);
+  (values || []).forEach(function (v) { if (v) seen[v] = true; });
+  return Object.keys(seen).sort();
+}
+
+// The request the switch button sends: POST /teamclaude/switch with the same
+// key the status poll uses. Pure, so the test suite can send exactly this
+// through a real proxy and prove the same-origin CSRF gate lets the page in.
+export function switchRequest(name, key) {
+  return {
+    url: '/teamclaude/switch',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ account: name }),
+    },
+  };
+}
+
+// The request the threshold control sends. The number goes as typed: what
+// counts as a percentage is the server's rule (1–100, kept to tenths), and a
+// second opinion here would only disagree with it on the edges.
+/**
+ * @param {number|string} percent
+ * @param {string|null|undefined} key
+ */
+export function thresholdRequest(percent, key) {
+  return {
+    url: '/teamclaude/threshold',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ percent: percent }),
+    },
+  };
+}
+
+// The stored 0–1 ratio as the number the control shows. Tenths, and no trailing
+// zero: the setting is quantised to tenths of a percent, so 0.98 must read back
+// as "98" rather than "98.0" for a re-save to be a no-op the operator can see.
+/** @param {unknown} value */
+export function thresholdPercentText(value) {
+  /** @type {any} */ var ratio = value;
+  // A per-bucket table: the control sets one number for every bucket, so what it
+  // shows is the default the table falls back to.
+  if (ratio && typeof ratio === 'object' && !Array.isArray(ratio)) ratio = ratio.default;
+  if (typeof ratio !== 'number' || !isFinite(ratio)) return '';
+  return String(Math.round(ratio * 1000) / 10);
+}
+
+// What to tell the operator after a threshold change. `dropped` is the part a
+// bare "saved" would hide: one number replaces a per-bucket table rather than
+// hiding one behind it, and the operator who set those buckets should hear it.
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function thresholdOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'threshold change failed' + (res && res.error ? ': ' + res.error : '') };
+  var pct = thresholdPercentText(res.switchThreshold);
+  var dropped = res.dropped || [];
+  if (dropped.length) return { kind: 'warn', text: 'switch threshold set to ' + pct + '% — dropped the per-bucket thresholds (' + dropped.join(', ') + ')' };
+  return { kind: 'ok', text: 'switch threshold set to ' + pct + '%' };
+}
+
+// What to tell the operator afterwards. The endpoint answers `ok` for the choice
+// being recorded and `eligible` for whether traffic will actually follow it —
+// two different things, and a bare "done" would be a lie for a spent target.
+/**
+ * POST for an account control. `spec` is {place}/{priority} for a priority
+ * move, or {disabled} to take an account out of rotation or put it back.
+ *
+ * @param {any} name
+ * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {string|null} key
+ */
+export function accountControlRequest(name, spec, key) {
+  var isPriority = spec.disabled === undefined;
+  /** @type {{ account: any, place?: any, priority?: any, disabled?: any }} */
+  var body = { account: name };
+  if (isPriority) {
+    if (spec.place) body.place = spec.place;
+    else body.priority = spec.priority;
+  } else {
+    body.disabled = spec.disabled;
+  }
+  return {
+    url: isPriority ? '/teamclaude/priority' : '/teamclaude/disable',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/**
+ * What to tell the operator afterwards. A priority move reports the number it
+ * landed on, which is the part the caller did not choose when it asked for
+ * 'first' or 'last'.
+ *
+ * @param {any} res
+ * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ */
+export function accountControlOutcome(res, spec) {
+  if (!res || !res.ok) return { kind: 'error', text: 'change failed' + (res && res.error ? ': ' + res.error : '') };
+  if (spec.disabled !== undefined) {
+    return { kind: 'ok', text: (res.disabled ? 'disabled ' : 'enabled ') + res.name };
+  }
+  return { kind: 'ok', text: res.name + ' priority ' + res.priority };
+}
+
+/**
+ * Whether the caller may use the control behind `path`. A status without the
+ * `caller` field keeps every control: the server still refuses what it must.
+ *
+ * @param {any} caller  status.caller
+ * @param {string} path
+ */
+export function callerCan(caller, path) {
+  var refused = caller && caller.refused;
+  return !Array.isArray(refused) || refused.indexOf(path) < 0;
+}
+
+/**
+ * The one line that explains the hidden controls, or null when nothing is
+ * hidden. Said once at the top instead of on every card.
+ *
+ * @param {any} caller  status.caller
+ */
+export function callerNotice(caller) {
+  if (!caller || !Array.isArray(caller.refused) || !caller.refused.length) return null;
+  return 'Signed in with the client key "' + caller.client + '". Changes to accounts and settings need the proxy key (proxy.apiKey), or the page opened without a key on the proxy\'s own machine, so those controls are hidden.';
+}
+
+/**
+ * Which card a note belongs to. One email can hold accounts in several orgs,
+ * and providers may reuse a name, so the name alone can match two cards.
+ *
+ * @param {any} account  one entry of status.accounts
+ */
+export function cardNoteKey(account) {
+  return [account.name, account.orgName || '', account.provider || ''].join('\n');
+}
+
+/**
+ * The result of the last action on one account card, while it is recent
+ * enough to show. Kept outside the card, which the poll rebuilds every few
+ * seconds.
+ *
+ * @param {any} notes  { [cardNoteKey]: { kind, text, at } }
+ * @param {string} key  cardNoteKey of the card
+ * @param {number} now
+ */
+export function cardNoteFor(notes, key, now) {
+  var n = notes && Object.prototype.hasOwnProperty.call(notes, key) ? notes[key] : null;
+  if (!n || now - n.at > CARD_NOTE_MAX_AGE_MS) return null;
+  return n;
+}
+
+export function switchOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'switch failed' + (res && res.error ? ': ' + res.error : '') };
+  if (res.eligible === false) return { kind: 'warn', text: 'switched to ' + res.account + ', but rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
+  return { kind: 'ok', text: 'switched to ' + res.account };
+}
+
+// One row per route the server reports — each model family the fleet meters
+// separately, autocreated or configured — plus a trailing row for everything
+// else, which goes to the current account. `target` is the server's own answer
+// to "where does a request for this family land right now", so the page does
+// not re-derive routing from quota bars; the eligible split says why a family
+// is where it is.
+export function routeRows(status) {
+  var s = status || {};
+  var blockedModels = s.blockedModels || [];
+  var rows = (s.routes || []).map(function (r) {
+    var accounts = r.accounts || [];
+    var name = r.name || '';
+    var match = r.match || [];
+    var target = r.target || null;
+    var pinned = r.pinned || null;
+    return {
+      kind: 'route',
+      name: name,
+      provider: r.provider || 'anthropic',
+      label: name.charAt(0).toUpperCase() + name.slice(1),
+      match: match.join(', '),
+      target: target,
+      pinned: pinned,
+      // A pin the server is not honouring (its account cannot serve the
+      // family right now): routing went elsewhere, and the row must say so
+      // rather than let "pinned" read as "this is the pin".
+      pinMismatch: !!pinned && pinned !== target,
+      // The blocklist answers 400 before selection, so a route whose every
+      // glob is blocked has a target no request will reach. A literal glob
+      // comparison covers the common case; the server's overlap logic is not
+      // shipped to the page.
+      blocked: match.length > 0 && match.every(function (g) { return blockedModels.indexOf(g) !== -1; }),
+      autocreated: !!r.autocreated,
+      eligible: accounts.filter(function (a) { return a.eligible; }).map(function (a) { return a.name; }),
+      ineligible: accounts.filter(function (a) { return !a.eligible; }).map(function (a) { return a.name; }),
+    };
+  });
+  if (rows.length) {
+    // The server reports one default per provider. A mixed Claude/Codex fleet
+    // has two independent cursors, so collapsing these into one global row is
+    // the exact ambiguity this table exists to remove. Older servers retain
+    // the original single-row fallback.
+    var defaults = s.defaultTargets || null;
+    var providers = defaults ? Object.keys(defaults).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+    if (!providers.length) providers = [rows[0].provider || 'anthropic'];
+    providers.forEach(function (provider) {
+      var current = (s.currentAccounts && s.currentAccounts[provider]) || s.currentAccount || null;
+      var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
+      rows.push({
+        kind: 'default', name: '',
+        label: defaults ? providerLabel(provider) + ' default' : 'Everything else',
+        provider: provider, match: '',
+        target: defaults ? defaults[provider] : (s.defaultTarget || current), current: current,
+        currentUnavailable: (cur && cur.unavailable) || null,
+        pinned: null, pinMismatch: false, blocked: false, autocreated: false, eligible: [], ineligible: [],
+      });
+    });
+  }
+  return rows;
+}
+
+// Consecutive client requests that ended with nothing usable. Claude Code has
+// its own retry loop, so two or three in a row are ordinary during a seconds-long
+// upstream wobble; five with no success in between is past any blip and past the
+// client's own budget. No age floor is needed — unlike a token-based guess, a
+// streak of five is true of no healthy session at any age, so a floor would only
+// delay a true positive.
+export var STARVED_MIN = 5;
+// The failure that makes this fire is usually fleet-wide, so every active
+// conversation starves at once — and one fan-out is a dozen of them under one
+// session's name. Naming all of them would bury the dashboard at the moment it
+// matters most; the count carries the scale, three names carry enough to go and
+// ask someone.
+export var STARVED_LIST_MAX = 3;
+
+/**
+ * What is wrong right now, worst first, or an empty list. Only states that are
+ * actionable and not ordinary operation: a spent weekly bucket, a rate-limit
+ * back-off and an upstream refusal are rotation and back-off working, and
+ * saying so every day would teach the reader to ignore the banner on the day it
+ * matters.
+ */
+export function problems(status) {
+  var s = status || {};
+  var out = [];
+
+  // Named when proxy.sessionDetail is on; otherwise the aggregate still says
+  // that something is starving, which is the half that must not be opt-in.
+  // When nothing can serve, every session starves and "it is failing" sends the
+  // operator hunting for a broken token. Say which, if the fleet agrees on why.
+  var accounts = s.accounts || [];
+  var stalled = accounts.filter(function (a) { return a.unavailable === 'quota' || a.unavailable === 'throttled'; });
+  var reasons = {};
+  stalled.forEach(function (a) { reasons[a.unavailable] = true; });
+  var why = accounts.length && stalled.length === accounts.length
+    ? ' — every account is ' + (reasons.quota && reasons.throttled ? 'over its quota threshold or in a rate-limit hold'
+      : reasons.quota ? 'over its quota threshold' : 'in a rate-limit hold') + '.'
+    : ' — it is failing, not idle.';
+
+  var sessions = s.sessions || {};
+  var named = (sessions.items ? sessionRows(sessions) : []).filter(function (r) {
+    return r.active && r.starved >= STARVED_MIN;
+  }).sort(function (a, b) { return b.starved - a.starved; });
+  named.slice(0, STARVED_LIST_MAX).forEach(function (r) {
+    out.push({
+      severity: 'bad', kind: 'starved-session',
+      // The session first, since that is the name an operator can go and find,
+      // and the conversation after it, because a streak belongs to one agent of
+      // a fan-out: without it three lines of one session read as the same line
+      // three times. Omitted when the record carries no conversation.
+      text: (r.client ? r.client + "'s session " : 'Session ') + r.session.slice(0, 8)
+        + (r.conversation ? ', conversation ' + r.conversation + ',' : '')
+        + ' has had ' + r.starved + ' requests in a row come back with nothing'
+        + (r.project ? ' (' + r.project + ')' : '') + why,
+    });
+  });
+  if (named.length > STARVED_LIST_MAX) {
+    out.push({
+      severity: 'bad', kind: 'starved-more',
+      text: 'and ' + (named.length - STARVED_LIST_MAX) + ' more conversations are getting nothing back.',
+    });
+  }
+  if (!named.length && (sessions.starvedMax || 0) >= STARVED_MIN) {
+    out.push({
+      severity: 'bad', kind: 'starved-session',
+      // A conversation, not a session: the streak is counted per conversation,
+      // and a session whose other agents are answering fine is not starving.
+      text: 'A conversation has had ' + sessions.starvedMax + ' requests in a row come back with nothing.'
+        + ' Turn on proxy.sessionDetail to see which.',
+    });
+  }
+
+  // Only the two states that do not clear themselves. `entitlement` is a
+  // five-minute cooldown and `upstream-rejected` is upstream's way of saying a
+  // shared bucket is spent — both expire on their own, like `quota` and
+  // `throttled`, and none of them wants a person.
+  var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
+  (s.accounts || []).forEach(function (a) {
+    var why = ATTENTION[a.unavailable];
+    if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
+  });
+
+  // Deliberately no spend line. `usedMinor` is month-to-date overage, so on a
+  // fleet that has overage switched on it is non-zero for most of the month —
+  // an always-lit banner, which is the thing this is trying not to be. The
+  // account card and `teamclaude status` both carry it, with the amount.
+
+  return out;
+}
+
+// The usage views the page offers, derived from the windows the tracker
+// actually keeps rather than listed again here: a window added or renamed in
+// client-usage.js must not leave a button behind that reads zero for everyone.
+// `total` is first because it is the lifetime counter the status payload has
+// always carried, and the view the page opens on.
+export const USAGE_VIEWS = [{ key: 'total', label: 'Total' }].concat(
+  Object.keys(USAGE_WINDOWS).map(key => ({ key, label: 'Last ' + key })));
+
+// Which counters one usage row shows. Every usage table reads the selected
+// window through this, rather than each renderer reaching into `windows`
+// itself — the Clients table and the per-dimension tables carry the same shape
+// and must not drift into answering the same question differently.
+/** @param {any} entry @param {string} [view] */
+export function usageFor(entry, view) {
+  var e = entry || {};
+  var src = !view || view === 'total' ? e : ((e.windows || {})[view] || {});
+  return {
+    requests: src.requests || 0,
+    connections: src.connections || 0,
+    inputTokens: src.inputTokens || 0,
+    outputTokens: src.outputTokens || 0,
+  };
+}
+
+/** How long an action's result stays above its account card. */
+export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
+
+const SHARED_HELPERS = [
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
+  outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+].map(fn => fn.toString()).join('\n\n');
+
+// The constants ride along: `problems` closes over the thresholds and
+// `accountBadges` over the reset-credit cut-off, so a page without them would
+// ReferenceError on first render. The same goes for the two tables
+// `thresholdBadgeText` reads. They follow the STARVED pair so the page's
+// constants stay in one block ahead of the helpers that use them.
+const SHARED_CONSTS = [
+  `var STARVED_MIN = ${STARVED_MIN};`,
+  `var STARVED_LIST_MAX = ${STARVED_LIST_MAX};`,
+  `var RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`,
+  `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
+  `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
+  `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
+  `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
+].join('\n');
+
+const PAGE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TeamClaude</title>
+<style>
+  /* Dark is the default, and stays the default for a viewer whose system says
+     nothing. The light palette is applied two ways: by the media query when no
+     choice has been stored (data-theme absent), and by the attribute when one
+     has. The media rule excludes an explicit dark choice, so choosing dark on a
+     light desktop is honoured rather than overridden by the system. */
+  :root {
+    color-scheme: dark;
+    --bg: #101418; --panel: #171d24; --line: #242c36;
+    --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd;
+    --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
+      --text: #1f2328; --dim: #59636e; --accent: #0969da;
+      --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+    }
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
+    --text: #1f2328; --dim: #59636e; --accent: #0969da;
+    --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 24px; }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  h2 { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin: 24px 0 8px; }
+  .sub { color: var(--dim); margin-bottom: 16px; }
+  .sub b { color: var(--text); font-weight: 600; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }
+  .row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .name { font-weight: 600; }
+  .tag { font-size: 12px; color: var(--dim); }
+  .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
+  .badge.active { color: var(--ok); border-color: var(--ok); }
+  .badge.throttled { color: var(--warn); border-color: var(--warn); }
+  .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
+  .badge.current { color: var(--accent); border-color: var(--accent); }
+  .badge.provider { color: var(--text); }
+  .badge.provider.codex { color: var(--accent); border-color: var(--accent); }
+  .badge.meta { color: var(--dim); }
+  .badge.sessions { color: var(--text); }
+  .badge.sessions.known { color: var(--dim); }
+  .badge.extra-usage { color: var(--warn); border-color: var(--warn); }
+  .badge.extra-usage.billing { color: var(--bad); border-color: var(--bad); }
+  .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
+  .quota .lbl { color: var(--dim); font-size: 12px; }
+  .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+  .quota.models .names { grid-column: 2 / 4; display: flex; flex-wrap: wrap; gap: 6px; }
+  .badge.model { color: var(--accent); border-color: var(--accent); }
+  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 4px; background: var(--ok); }
+  .bar i.warn { background: var(--warn); }
+  .bar i.bad { background: var(--bad); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 10px; font-variant-numeric: tabular-nums; }
+  th { color: var(--dim); font-size: 12px; font-weight: 500; border-bottom: 1px solid var(--line); }
+  td { border-bottom: 1px solid var(--line); }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; }
+  .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
+  .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
+  .act:hover { background: var(--accent); color: var(--bg); }
+  .act:disabled { opacity: .5; cursor: default; }
+  #note { font-size: 12px; margin: 8px 0; display: none; }
+  #note.ok, .cardnote.ok { color: var(--ok); } #note.warn, .cardnote.warn { color: var(--warn); } #note.error, .cardnote.error { color: var(--bad); }
+  .cardnote { font-size: 12px; margin: 8px 0 4px; }
+  #caller { font-size: 12px; margin: 8px 0; color: var(--dim); }
+  .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
+  .hint { color: var(--dim); font-size: 12px; margin-left: auto; }
+  .actions { display: flex; gap: 8px; margin: 8px 0 16px; }
+  .actions button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
+  .actions button:hover { color: var(--text); border-color: var(--text); }
+  .actions button:disabled { opacity: .5; cursor: default; }
+  .actions button.sel { color: var(--text); border-color: var(--accent); }
+  .actions .lbl { color: var(--dim); font-size: 12px; align-self: center; }
+  /* Pushed to the far end: the two buttons on the left act on the fleet as it
+     stands, while this one edits a stored setting — a gap says so without a
+     second row. */
+  .actions .thr { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: var(--dim); }
+  .actions .thr input { width: 64px; font: inherit; font-size: 12px; padding: 4px 8px; text-align: right; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  td.dim { color: var(--dim); }
+  .ok { color: var(--ok); }
+  .no { color: var(--dim); text-decoration: line-through; }
+  .pin { color: var(--accent); font-size: 12px; }
+  .warnt { color: var(--warn); font-size: 12px; }
+  .badt { color: var(--bad); }
+  #err { color: var(--bad); margin: 12px 0; display: none; }
+  #problems { display: none; margin: 0 0 16px; }
+  #problems div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
+  #problems .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
+  #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
+  #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
+  #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
+  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
+  footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
+</style>
+<script>
+(function () {
+  try {
+    var t = localStorage.getItem('teamclaude-dashboard-theme');
+    if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+  } catch (e) { /* storage disabled: the media query still decides */ }
+})();
+</script>
+</head>
+<body>
+<main>
+  <div id="keybox">
+    <h1>TeamClaude</h1>
+    <p class="sub">Enter your proxy key to view status.</p>
+    <input id="key" type="password" placeholder="tc-..." autocomplete="off">
+    <br><button id="go">Connect</button>
+  </div>
+  <div id="app" style="display:none">
+    <h1>TeamClaude</h1>
+    <p class="sub" id="summary"></p>
+    <div class="actions">
+      <button id="reload" type="button">Reload config</button>
+      <button id="probe" type="button">Probe quotas</button>
+      <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
+      <span class="thr">
+        <label for="thrVal">Switch at</label>
+        <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
+        <span>%</span>
+        <button id="thrSet" type="button">Set</button>
+      </span>
+    </div>
+    <div id="err"></div>
+    <div id="problems"></div>
+    <div id="note"></div>
+    <div id="caller" style="display:none"><span id="callerText"></span> <button id="changeKey" class="act" type="button">Change key</button></div>
+    <div id="routesWrap" style="display:none">
+      <h2>Routing</h2>
+      <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
+    </div>
+    <h2>Accounts</h2>
+    <div id="accounts"></div>
+    <div id="usageViewWrap" class="actions" style="display:none"></div>
+    <div id="clientsWrap" style="display:none">
+      <h2 id="clientsHeading">Clients</h2>
+      <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
+    </div>
+    <div id="dimensionsWrap"></div>
+    <div id="sessionsWrap" style="display:none">
+      <h2>Sessions</h2>
+      <div class="card" style="padding:0">
+        <div class="filters">
+          <label>Project <select id="fProject"></select></label>
+          <label>Client <select id="fClient"></select></label>
+          <span class="hint" id="sessionCount"></span>
+        </div>
+        <div style="padding:4px 6px"><table id="sessions"></table></div>
+      </div>
+    </div>
+    <footer id="foot"></footer>
+  </div>
+</main>
+<script>
+(function () {
+  'use strict';
+  var KEY = 'teamclaude-dashboard-key';
+  var THEME_KEY = 'teamclaude-dashboard-theme';
+  var POLL_MS = 5000;
+  var timer = null;
+  var lastStatus = null;
+  var sessionFilters = { project: '', client: '' };
+  var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
+  // The usage window applies to every table the usage trackers feed (Clients
+  // and each configured dimension), so it is page state rather than per-table:
+  // two controls left on different windows would invite reading one table's
+  // number against the other's. Like the sort, it survives the poll.
+  var usageView = 'total';
+  var usageButtons = [];
+  var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
+
+${SHARED_CONSTS}
+
+${SHARED_HELPERS}
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function fmtNum(n) {
+    n = Number(n) || 0;
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'm';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+    return String(n);
+  }
+
+  // Status timestamps arrive in both shapes: epoch milliseconds (account
+  // quota resets, account usage.lastUsed) and ISO strings (client lastUsed).
+  // Date.parse() only handles strings, so numbers must pass through as-is —
+  // feeding it a number silently yields NaN and the field just never renders.
+  function parseTs(v) {
+    if (v == null) return NaN;
+    if (typeof v === 'number') return v;
+    return Date.parse(v);
+  }
+
+  function fmtAgo(ts) {
+    var t = parseTs(ts);
+    if (isNaN(t)) return '';
+    var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.round(s / 60) + 'm ago';
+    if (s < 86400) return Math.round(s / 3600) + 'h ago';
+    return Math.round(s / 86400) + 'd ago';
+  }
+
+  function fmtIn(sec) {
+    if (sec == null) return '';
+    var s = Math.max(0, Math.round(sec));
+    if (s < 3600) return Math.round(s / 60) + 'm';
+    if (s < 86400) return (s / 3600).toFixed(1) + 'h';
+    return (s / 86400).toFixed(1) + 'd';
+  }
+
+  // Absolute wall-clock of a future timestamp: "17:30" today, "Wed 09:00"
+  // beyond 24h — the countdown says how long, this says when.
+  function fmtClock(ts) {
+    var d = new Date(ts);
+    var time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (ts - Date.now() >= 86400000) {
+      return d.toLocaleDateString([], { weekday: 'short' }) + ' ' + time;
+    }
+    return time;
+  }
+
+  function quotaRow(label, ratio, resetAt) {
+    var row = el('div', 'quota');
+    row.appendChild(el('span', 'lbl', label));
+    var bar = el('div', 'bar');
+    var fill = el('i');
+    var pct = ratio == null ? null : Math.max(0, Math.min(1, Number(ratio)));
+    fill.style.width = (pct == null ? 0 : pct * 100) + '%';
+    if (pct != null && pct >= 0.9) fill.className = 'bad';
+    else if (pct != null && pct >= 0.7) fill.className = 'warn';
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    var resetTs = parseTs(resetAt);
+    var reset = !isNaN(resetTs) && resetTs > Date.now()
+      ? ' · ' + fmtIn((resetTs - Date.now()) / 1000) + ' · ' + fmtClock(resetTs)
+      : '';
+    row.appendChild(el('span', 'val', (pct == null ? '?' : Math.round(pct * 100) + '%') + reset));
+    return row;
+  }
+
+  // A "Model" row under Session: what this account is serving right now.
+  function modelsRow(usage) {
+    var labels = recentModelLabels(usage);
+    if (!labels.length) return null;
+    var row = el('div', 'quota models');
+    row.appendChild(el('span', 'lbl', 'Model'));
+    var names = el('span', 'names');
+    labels.forEach(function (l) { names.appendChild(el('span', 'badge model', l)); });
+    row.appendChild(names);
+    return row;
+  }
+
+  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds, caller) {
+    var card = el('div', 'card');
+    var head = el('div', 'row');
+    head.appendChild(el('span', 'name', a.name));
+    var isCurrent = currentAccounts
+      ? currentAccounts[a.provider] === a.name
+      : a.name === current;
+    accountBadges(a, current, currentAccounts, null, fleetThreshold, fleetThresholds).forEach(function (badge) {
+      head.appendChild(el('span', 'badge ' + badge.cls, badge.text));
+    });
+    // Last in the row so the badges sit in the same place on every card.
+    if (!isCurrent) {
+      var btn = el('button', 'act', 'switch');
+      btn.addEventListener('click', function () { doSwitch(a.name, cardNoteKey(a), btn); });
+      head.appendChild(btn);
+    }
+    // Account controls, in the order an operator reaches for them: take it out
+    // of rotation, or move where rotation reaches it. Only the enable/disable
+    // control is shown for a disabled account — the rest would be moving an
+    // account that nothing will select anyway.
+    // Named ctl* deliberately: var is function-scoped, and this builder already
+    // declares a "last" further down (the last-used string). A button named
+    // last here is overwritten by that before any click can fire.
+    // A control this key would be refused is not drawn at all; the line under
+    // the actions says why, once (callerNotice).
+    if (callerCan(caller, '/teamclaude/disable')) {
+      var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
+      ctlDisable.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { disabled: !a.disabled }, ctlDisable); });
+      head.appendChild(ctlDisable);
+    }
+    if (!a.disabled && callerCan(caller, '/teamclaude/priority')) {
+      var ctlFirst = el('button', 'act', 'prioritize');
+      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'first' }, ctlFirst); });
+      head.appendChild(ctlFirst);
+      var ctlLast = el('button', 'act', 'deprioritize');
+      ctlLast.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'last' }, ctlLast); });
+      head.appendChild(ctlLast);
+    }
+    card.appendChild(head);
+    if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    var q = a.quota || {};
+    var models = modelsRow(a.usage);
+    if (q.unified5h != null || q.unified7d != null) {
+      // No Session row for a plan with no session window (see showSessionRow).
+      if (showSessionRow(q)) card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
+      if (models) card.appendChild(models);
+      models = null;
+      card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
+      // Model-scoped weekly buckets are learned from the usage endpoint rather
+      // than declared, so hard-coding the two families that have dedicated
+      // fields drew an incomplete picture the moment upstream metered a third.
+      scopedWeeklyRows(q).forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
+    } else if (q.tokensLimit != null && q.tokensRemaining != null) {
+      card.appendChild(quotaRow('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt));
+    } else if (q.backend && (q.backend.text || q.backend.utilization != null)) {
+      var bq = backendQuotaRows(q.backend);
+      bq.rows.forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
+      if (bq.text) card.appendChild(el('div', 'usage', bq.text));
+    } else {
+      card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
+    }
+    if (models) card.appendChild(models);
+    // Spend on this account that did not come through the proxy (#475).
+    var outside = outsideSpendText(q.outsideSpend);
+    if (outside) card.appendChild(el('div', 'usage', 'outside: ' + outside));
+    var forecast = forecastText(q.forecast, Date.now());
+    if (forecast) card.appendChild(el('div', 'usage', 'forecast: ' + forecast));
+    var u = a.usage || {};
+    var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
+    card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
+    return card;
+  }
+
+  // The window a usage table is showing, in its own heading. The control sits
+  // above the Clients table, but the dimension tables are below it and can be
+  // scrolled clear of it — and a five-hour figure under a bare "Input tok" is
+  // the one way this feature can state a number under the wrong label.
+  // Last used is a lifetime figure in a table whose heading may name a window.
+  // Under Total that needs no saying; under a window it does, or it reads as
+  // the one thing this control must never do — a number under the wrong label.
+  function lastUsedLabel() {
+    return usageView === 'total' ? 'Last used' : 'Last used (all time)';
+  }
+
+  function usageHeading(base) {
+    if (usageView === 'total') return base;
+    var view = USAGE_VIEWS.filter(function (v) { return v.key === usageView; })[0];
+    return view ? base + ' · ' + view.label.toLowerCase() : base;
+  }
+
+  function renderClients(clients) {
+    var wrap = document.getElementById('clientsWrap');
+    var names = Object.keys(clients || {});
+    if (!names.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    document.getElementById('clientsHeading').textContent = usageHeading('Clients');
+    // Sorted on the window being shown, not on the lifetime total: a table
+    // ordered by all-time spend while displaying the last five hours would put
+    // the quiet clients on top of the busy one.
+    names.sort(function (a, b) {
+      var ua = usageFor(clients[a], usageView), ub = usageFor(clients[b], usageView);
+      return (ub.inputTokens + ub.outputTokens) - (ua.inputTokens + ua.outputTokens);
+    });
+    var table = document.getElementById('clients');
+    table.textContent = '';
+    var hr = el('tr');
+    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', lastUsedLabel()].forEach(function (h, i) {
+      hr.appendChild(el('th', i ? 'num' : '', h));
+    });
+    table.appendChild(hr);
+    names.forEach(function (n) {
+      var c = clients[n];
+      var u = usageFor(c, usageView);
+      var tr = el('tr');
+      tr.appendChild(el('td', '', n));
+      tr.appendChild(el('td', 'num', fmtNum(u.requests)));
+      tr.appendChild(el('td', 'num', fmtNum(u.connections)));
+      tr.appendChild(el('td', 'num', fmtNum(u.inputTokens)));
+      tr.appendChild(el('td', 'num', fmtNum(u.outputTokens)));
+      // Last used stays the lifetime figure under every window: it answers
+      // when this client was last seen at all, which a window cannot.
+      tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
+      table.appendChild(tr);
+    });
+  }
+
+  // The window buttons, built once: the windows are fixed by the server that
+  // served this page. Visibility is decided per render, since the control only
+  // means something when there is a usage table under it.
+  function buildUsageViews() {
+    var wrap = document.getElementById('usageViewWrap');
+    wrap.appendChild(el('span', 'lbl', 'Usage window'));
+    USAGE_VIEWS.forEach(function (v) {
+      var btn = el('button', '', v.label);
+      btn.addEventListener('click', function () {
+        usageView = v.key;
+        markUsageView();
+        if (lastStatus) render(lastStatus);
+      });
+      wrap.appendChild(btn);
+      usageButtons.push({ key: v.key, btn: btn });
+    });
+    markUsageView();
+  }
+
+  function markUsageView() {
+    usageButtons.forEach(function (b) { b.btn.className = b.key === usageView ? 'sel' : ''; });
+  }
+
+  // Header cells that re-sort in place. The sort is state, not a re-fetch, so
+  // it survives the 5s poll: re-rendering re-reads sortState below.
+  function addSortableHeader(tr, table, label, key, numeric) {
+    var th = el('th', (numeric ? 'num ' : '') + 'sortable', label + (sortState[table].key === key ? (sortState[table].dir === 'asc' ? ' ▲' : ' ▼') : ''));
+    th.addEventListener('click', function () {
+      var st = sortState[table];
+      if (st.key === key) st.dir = st.dir === 'asc' ? 'desc' : 'asc';
+      else { st.key = key; st.dir = numeric ? 'desc' : 'asc'; }
+      if (lastStatus) render(lastStatus);
+    });
+    tr.appendChild(th);
+  }
+
+  // Session and conversation are two columns rather than one composite: sorting
+  // by Session brings a fan-out's rows together (the sort is stable, so they
+  // stay in recency order inside it) and Conv is the only column that differs
+  // between them. Narrow on purpose — it is a digest, not a name.
+  var SESSION_COLUMNS = [
+    { key: 'session', label: 'Session' },
+    { key: 'conversation', label: 'Conv' },
+    { key: 'client', label: 'Client' },
+    { key: 'project', label: 'Project' },
+    { key: 'accounts', label: 'Accounts' },
+    { key: 'requests', label: 'Req', num: true },
+    { key: 'cacheRead', label: 'Cache read', num: true },
+    { key: 'cacheCreation', label: 'Cache write', num: true },
+    { key: 'input', label: 'Input', num: true },
+    { key: 'output', label: 'Output', num: true },
+    { key: 'context', label: 'Context', num: true },
+    { key: 'lastSeen', label: 'Last seen', num: true },
+  ];
+
+  function renderSessions(sessions) {
+    var wrap = document.getElementById('sessionsWrap');
+    // Absent unless proxy.sessionDetail is on — the aggregate counts in the
+    // summary line stay either way.
+    if (!sessions || !sessions.items) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+
+    var all = sessionRows(sessions);
+    var projectSel = document.getElementById('fProject');
+    var clientSel = document.getElementById('fClient');
+    fillFilter(projectSel, uniqSorted(all.map(function (r) { return r.project; })), sessionFilters.project);
+    fillFilter(clientSel, uniqSorted(all.map(function (r) { return r.client; })), sessionFilters.client);
+    sessionFilters.project = projectSel.value;
+    sessionFilters.client = clientSel.value;
+
+    var rows = sortRows(filterSessionRows(all, sessionFilters), sortState.sessions.key, sortState.sessions.dir);
+    // Conversations, not sessions: one client session contributes a row per
+    // agent it has in flight, and counting rows as sessions would report a
+    // fleet carrying several times the clients it has.
+    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length + ' conversations';
+
+    var table = document.getElementById('sessions');
+    table.textContent = '';
+    var hr = el('tr');
+    SESSION_COLUMNS.forEach(function (c) { addSortableHeader(hr, 'sessions', c.label, c.key, !!c.num); });
+    table.appendChild(hr);
+    rows.forEach(function (r) {
+      var tr = el('tr');
+      tr.appendChild(el('td', r.active ? '' : 'dim', r.session));
+      tr.appendChild(el('td', r.active ? '' : 'dim', r.conversation || '—'));
+      tr.appendChild(el('td', '', r.client || '—'));
+      tr.appendChild(el('td', '', r.project || '—'));
+      tr.appendChild(el('td', '', r.accounts || '—'));
+      ['requests', 'cacheRead', 'cacheCreation', 'input', 'output', 'context'].forEach(function (k) {
+        tr.appendChild(el('td', 'num', fmtNum(r[k])));
+      });
+      tr.appendChild(el('td', 'num', r.lastSeen ? fmtAgo(r.lastSeen) : '—'));
+      table.appendChild(tr);
+    });
+  }
+
+  function fillFilter(select, values, value) {
+    select.textContent = '';
+    var all = el('option', '', 'All');
+    all.value = '';
+    select.appendChild(all);
+    values.forEach(function (v) {
+      var option = el('option', '', v);
+      option.value = v;
+      select.appendChild(option);
+    });
+    select.value = values.indexOf(value) === -1 ? '' : value;
+  }
+
+  // One table per configured usage dimension (proxy.usageDimensions).
+  function renderDimensions(dimensions) {
+    var wrap = document.getElementById('dimensionsWrap');
+    wrap.textContent = '';
+    Object.keys(dimensions || {}).forEach(function (name) {
+      var entries = dimensions[name] || {};
+      var rows = Object.keys(entries).map(function (key) {
+        var e = entries[key] || {};
+        var u = usageFor(e, usageView);
+        return {
+          name: key,
+          requests: u.requests,
+          inputTokens: u.inputTokens,
+          outputTokens: u.outputTokens,
+          lastUsed: e.lastUsed ? Date.parse(e.lastUsed) : 0,
+        };
+      });
+      if (!rows.length) return;
+      sortState[name] = sortState[name] || { key: 'inputTokens', dir: 'desc' };
+      rows = sortRows(rows, sortState[name].key, sortState[name].dir);
+
+      wrap.appendChild(el('h2', '', usageHeading(name.charAt(0).toUpperCase() + name.slice(1))));
+      var card = el('div', 'card');
+      card.style.padding = '4px 6px';
+      var table = el('table');
+      var hr = el('tr');
+      [{ key: 'name', label: name.charAt(0).toUpperCase() + name.slice(1) },
+        { key: 'requests', label: 'Req', num: true },
+        { key: 'inputTokens', label: 'Input tok', num: true },
+        { key: 'outputTokens', label: 'Output tok', num: true },
+        { key: 'lastUsed', label: lastUsedLabel(), num: true }].forEach(function (c) {
+        addSortableHeader(hr, name, c.label, c.key, !!c.num);
+      });
+      table.appendChild(hr);
+      rows.forEach(function (r) {
+        var tr = el('tr');
+        tr.appendChild(el('td', '', r.name));
+        tr.appendChild(el('td', 'num', fmtNum(r.requests)));
+        tr.appendChild(el('td', 'num', fmtNum(r.inputTokens)));
+        tr.appendChild(el('td', 'num', fmtNum(r.outputTokens)));
+        tr.appendChild(el('td', 'num', r.lastUsed ? fmtAgo(r.lastUsed) : '—'));
+        table.appendChild(tr);
+      });
+      card.appendChild(table);
+      wrap.appendChild(card);
+    });
+  }
+
+  // Where each metered family goes right now, and which accounts could take
+  // it. The last row is the default: everything without its own route lands
+  // on the current account.
+  function renderRoutes(s) {
+    var wrap = document.getElementById('routesWrap');
+    var rows = routeRows(s);
+    if (!rows.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    var table = document.getElementById('routes');
+    table.textContent = '';
+    var hr = el('tr');
+    ['Family', 'Goes to', 'Can serve it'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    table.appendChild(hr);
+    rows.forEach(function (r) {
+      var tr = el('tr');
+      var fam = el('td', '', r.label + (r.match ? ' ' : ''));
+      if (r.match) fam.appendChild(el('span', 'tag', r.match));
+      if (r.provider) fam.appendChild(el('span', 'tag', ' ' + providerLabel(r.provider)));
+      tr.appendChild(fam);
+      var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
+      if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
+      if (r.pinMismatch) to.appendChild(el('span', 'warnt', ' (not eligible)'));
+      if (r.kind === 'default' && r.target !== r.current) {
+        to.appendChild(el('span', 'warnt', r.currentUnavailable
+          ? ' · current account ' + r.current + ' is blocked: ' + (UNAVAILABLE_TEXT[r.currentUnavailable] || r.currentUnavailable)
+          : ' · outranks the current account ' + r.current));
+      }
+      tr.appendChild(to);
+      var can = el('td', r.kind === 'default' ? 'dim' : '');
+      if (r.kind === 'default') can.textContent = 'no route of its own';
+      else if (r.blocked) can.textContent = '—';
+      else if (!r.eligible.length && !r.ineligible.length) can.textContent = '—';
+      else {
+        can.appendChild(el('span', 'ok', r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length) + (r.ineligible.length ? ' ' : '')));
+        if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.join(', ')));
+      }
+      tr.appendChild(can);
+      table.appendChild(tr);
+    });
+  }
+
+  // Top of the page and only when something is wrong: a banner that is always
+  // on is a banner nobody reads.
+  function renderProblems(s) {
+    var wrap = document.getElementById('problems');
+    var list = problems(s);
+    wrap.textContent = '';
+    if (!list.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = 'block';
+    list.forEach(function (p) { wrap.appendChild(el('div', p.severity, p.text)); });
+  }
+
+  function render(s) {
+    lastStatus = s;
+    // The poll owns the threshold field except while it is being typed into:
+    // rewriting it every POLL_MS would delete the operator's half-entered
+    // number under the cursor. It also means a change made from the CLI, the
+    // TUI or another browser shows up here without a refresh.
+    var thrInput = document.getElementById('thrVal');
+    if (document.activeElement !== thrInput) thrInput.value = thresholdPercentText(s.switchThreshold);
+    // Kept visible read-only: the number still tells a client where the fleet switches.
+    var canThreshold = callerCan(s.caller, '/teamclaude/threshold');
+    thrInput.disabled = !canThreshold;
+    document.getElementById('thrSet').style.display = canThreshold ? '' : 'none';
+    var notice = callerNotice(s.caller);
+    document.getElementById('callerText').textContent = notice || '';
+    document.getElementById('caller').style.display = notice ? 'block' : 'none';
+    var sess = s.sessions || {};
+    var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
+    var sum = document.getElementById('summary');
+    sum.textContent = '';
+    var currentAccounts = s.currentAccounts || null;
+    var providerIds = currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+    sum.appendChild(el('span', '', providerIds.length ? 'active accounts ' : 'active account '));
+    if (providerIds.length) {
+      providerIds.forEach(function (provider, i) {
+        if (i) sum.appendChild(el('span', '', ' · '));
+        sum.appendChild(el('span', '', providerLabel(provider) + ': '));
+        sum.appendChild(el('b', '', currentAccounts[provider] || 'none'));
+      });
+    } else {
+      sum.appendChild(el('b', '', s.currentAccount || 'none'));
+    }
+    // Conversations, like the table below it and the count above that table:
+    // one page saying "sessions" here and "conversations" there would read as
+    // two different quantities rather than one counted twice.
+    sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
+    var probe = s.probe || {};
+    var probeBtn = document.getElementById('probe');
+    probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
+    probeBtn.disabled = !!probe.running;
+    var acc = document.getElementById('accounts');
+    acc.textContent = '';
+    var now = Date.now();
+    (s.accounts || []).forEach(function (a) {
+      var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
+      if (cn) acc.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+      acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+    });
+    renderProblems(s);
+    renderRoutes(s);
+    renderClients(s.clients);
+    renderDimensions(s.usageDimensions);
+    // The control means nothing with no usage table under it. The payload
+    // already answers that: the server omits a dimension with no entries.
+    var anyUsage = Object.keys(s.clients || {}).length || Object.keys(s.usageDimensions || {}).length;
+    document.getElementById('usageViewWrap').style.display = anyUsage ? '' : 'none';
+    renderSessions(s.sessions);
+    document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
+  }
+
+  // An account action reports above its own card, where the click was: the
+  // page-wide note sits above the cards and is off screen for a card further down.
+  // No prototype: an account named __proto__ would otherwise set it.
+  var cardNotes = Object.create(null);
+  // With now set it re-renders at once, for a failure no poll follows. Otherwise the
+  // poll the caller starts shows it: re-rendering the stale status here would
+  // rebuild the card and re-enable a switch button that must stay disabled
+  // until the poll reports the switch.
+  function cardNote(key, kind, text, now) {
+    cardNotes[key] = { kind: kind, text: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' · ' + text, at: Date.now() };
+    if (now && lastStatus) render(lastStatus);
+  }
+
+  function note(kind, text) {
+    var n = document.getElementById('note');
+    n.className = kind;
+    n.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' · ' + text;
+    n.style.display = 'block';
+  }
+
+  // One manual switch. The endpoint is a nudge, not a pin: it sets the current
+  // account and normal rotation resumes from there (see the handler's comment
+  // in server.js for what "eligible" means).
+  function doSwitch(name, noteKey, btn) {
+    btn.disabled = true;
+    var r = switchRequest(name, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = switchOutcome(json);
+        cardNote(noteKey, out.kind, out.text, false);
+        // Re-enabled on any non-success, whether the server refused or the
+        // fetch threw, so the two failure paths leave the button in one state.
+        if (out.kind !== 'ok') btn.disabled = false;
+        poll();
+      })
+      .catch(function (e) { cardNote(noteKey, 'error', 'switch failed: ' + e.message, true); btn.disabled = false; });
+  }
+
+  function doControlAccount(name, noteKey, spec, btn) {
+    btn.disabled = true;
+    var r = accountControlRequest(name, spec, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = accountControlOutcome(json, spec);
+        cardNote(noteKey, out.kind, out.text, false);
+        poll();
+      })
+      .catch(function (e) { cardNote(noteKey, 'error', 'change failed: ' + e.message, true); })
+      // Unlike doSwitch, always re-enabled: the card is rebuilt by the poll
+      // above, and a button that stayed dead after a refused change would be
+      // the only control an operator could not retry.
+      .finally(function () { btn.disabled = false; });
+  }
+
+  // The one control here that writes a setting rather than nudging the running
+  // fleet: the server saves it to the config file and reloads, so it holds
+  // across a restart. One number governs every quota bucket — a fleet using
+  // per-bucket thresholds is told what the save dropped (thresholdOutcome).
+  function doThreshold(btn) {
+    var input = document.getElementById('thrVal');
+    var raw = input.value.trim();
+    // Left to the server otherwise: an empty field is the one case it would see
+    // as a missing key rather than a bad number, and "invalid request body" is
+    // not what an operator who cleared the box needs to read.
+    if (!raw) { note('error', 'switch threshold: enter a percentage from 1 to 100'); return; }
+    btn.disabled = true;
+    var r = thresholdRequest(Number(raw), localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = thresholdOutcome(json);
+        note(out.kind, out.text);
+        // The stored number, not the typed one: the setting is quantised to
+        // tenths, and a field left reading 97.55 after a save of 97.6 invites a
+        // re-save that changes nothing.
+        if (json.ok) input.value = thresholdPercentText(json.switchThreshold);
+        poll();
+      })
+      .catch(function (e) { note('error', 'switch threshold change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  function doControl(path, label, btn) {
+    btn.disabled = true;
+    fetch(path, { method: 'POST', headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        if (json.ok !== true) { note('error', label + ' failed' + (json.error ? ': ' + json.error : '')); return; }
+        note('ok', label + ' complete');
+        poll();
+      })
+      .catch(function (e) { note('error', label + ' failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  function showKeybox() {
+    if (timer) { clearInterval(timer); timer = null; }
+    document.getElementById('app').style.display = 'none';
+    document.getElementById('keybox').style.display = 'block';
+    document.getElementById('key').focus();
+  }
+
+  function poll() {
+    fetch('/teamclaude/status', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        // 403 is the loopback exemption refusing a key-less request (a Host
+        // that does not name this machine, e.g. behind a local reverse proxy
+        // that adds no forwarding headers). A valid key clears that gate too.
+        if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json();
+      })
+      .then(function (s) {
+        if (!s) return;
+        document.getElementById('keybox').style.display = 'none';
+        document.getElementById('app').style.display = '';
+        document.getElementById('err').style.display = 'none';
+        render(s);
+      })
+      .catch(function (e) {
+        var err = document.getElementById('err');
+        err.style.display = 'block';
+        err.textContent = 'Cannot reach the proxy: ' + e.message;
+        // The banner lives inside #app, which stays hidden until a first
+        // status lands; without this a first poll that fails is a blank page.
+        if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
+      });
+  }
+
+  function start() {
+    poll();
+    if (!timer) timer = setInterval(poll, POLL_MS);
+  }
+
+  document.getElementById('go').addEventListener('click', function () {
+    var v = document.getElementById('key').value.trim();
+    if (!v) return;
+    localStorage.setItem(KEY, v);
+    start();
+  });
+  document.getElementById('key').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('go').click();
+  });
+  // Theme: system → light → dark → system. "system" is the absence of a
+  // stored choice, so a viewer who never touches this keeps following their
+  // desktop, and one who does is not re-decided for by it later.
+  var THEMES = ['system', 'light', 'dark'];
+  function readTheme() {
+    try {
+      var t = localStorage.getItem(THEME_KEY);
+      return t === 'light' || t === 'dark' ? t : 'system';
+    } catch (e) { return 'system'; }
+  }
+  function applyTheme(theme) {
+    if (theme === 'system') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', theme);
+    var btn = document.getElementById('theme');
+    // Name the state, not the action: a button reading "Dark" while the page is
+    // light is the ambiguity every theme toggle has, and this one says where it
+    // is rather than where it would go.
+    btn.textContent = theme === 'system' ? 'Theme: system' : theme === 'light' ? 'Theme: light' : 'Theme: dark';
+  }
+  function storeTheme(theme) {
+    try {
+      if (theme === 'system') localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, theme);
+    } catch (e) { /* storage disabled: the choice lasts for this page only */ }
+  }
+  // The current theme lives in a variable rather than being re-read from
+  // storage on each click: with storage blocked, readTheme() would always say
+  // 'system' and the button would be stuck on 'light' instead of cycling.
+  var theme = readTheme();
+  applyTheme(theme);
+  document.getElementById('theme').addEventListener('click', function () {
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    storeTheme(theme);
+    applyTheme(theme);
+  });
+
+  document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
+  document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
+  document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  // A client key is a valid key, so nothing else on the page would ever ask for
+  // another one: the operator needs a way back to the key box.
+  document.getElementById('changeKey').addEventListener('click', function () { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); });
+  document.getElementById('thrVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('thrSet').click();
+  });
+  buildUsageViews();
+
+  ['fProject', 'fClient'].forEach(function (id) {
+    document.getElementById(id).addEventListener('change', function () {
+      sessionFilters[id === 'fProject' ? 'project' : 'client'] = this.value;
+      if (lastStatus) render(lastStatus);
+    });
+  });
+
+  // Poll before asking: a loopback browser is key-exempt, so the prompt is
+  // shown only once the server refuses the request without a valid key.
+  start();
+})();
+</script>
+</body>
+</html>
+`;

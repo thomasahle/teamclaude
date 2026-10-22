@@ -1,11 +1,12 @@
 {
   "name": "@karpeleslab/teamclaude",
-  "version": "1.1.13",
-  "description": "Multi-account Claude proxy with automatic quota-based rotation",
+  "version": "1.1.25",
+  "description": "Multi-account proxy for Claude Code and Codex: pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota",
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "teamclaude": "src/index.js"
+    "teamclaude": "src/index.js",
+    "teamrouter": "src/index.js"
   },
   "files": [
     "src/"
@@ -13,14 +14,24 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test --test-timeout=120000",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json",
+    "typecheck:strict": "node scripts/typecheck-strict.mjs"
   },
   "keywords": [
     "claude",
     "anthropic",
+    "claude-code",
+    "codex",
+    "openai",
+    "chatgpt",
+    "deepseek",
     "proxy",
     "load-balancer",
-    "multi-account"
+    "multi-account",
+    "quota",
+    "rate-limiting",
+    "cli"
   ],
   "license": "MIT",
   "repository": {
@@ -35,6 +46,8 @@
     "node": ">=20.0.0"
   },
   "devDependencies": {
-    "eslint": "^9.0.0"
+    "@types/node": "20.19.43",
+    "eslint": "^9.0.0",
+    "typescript": "5.9.2"
   }
 }

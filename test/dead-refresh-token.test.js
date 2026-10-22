@@ -91,3 +91,95 @@ test('a successful refresh clears any stale guard', async () => {
   await m.ensureTokenFresh(0);            // token still expiring → tries again freely
   assert.strictEqual(calls, before + 1, 'no lingering guard after a success');
 });
+
+// A re-import can supply a NEW access token with the SAME dead refresh token
+// (updateAccountTokens resets status to 'active'). The guard still blocks the
+// refresh, so the account must read as errored again or the access token's 401
+// would be relayed to the client instead of rotating.
+test('a re-imported access token with the same dead refresh token reads as errored, not retried', async () => {
+  let calls = 0;
+  const m = mgr(async () => { calls++; throw authError(400); });
+  await m.ensureTokenFresh(0);
+  assert.strictEqual(m.accounts[0].status, 'error');
+
+  m.updateAccountTokens(0, { accessToken: 'at-reimported', refreshToken: 'rt-dead', expiresAt: Date.now() - 1000 });
+  assert.strictEqual(m.accounts[0].status, 'active', 'updateAccountTokens clears the error state');
+
+  await m.ensureTokenFresh(0, true);      // the 401 path forces a refresh
+  assert.strictEqual(calls, 1, 'the dead token is still not re-sent');
+  assert.strictEqual(m.accounts[0].status, 'error', 'but the account is sidelined so the request rotates');
+});
+
+test('the dead-token field is part of the account record from construction', () => {
+  const m = mgr(async () => { throw authError(400); });
+  assert.ok('_deadRefreshToken' in m.accounts[0]);
+  assert.strictEqual(m.accounts[0]._deadRefreshToken, null);
+});
+
+// A config reload or `teamclaude import` can install new tokens WHILE a refresh
+// of the old ones is awaiting upstream. The outcome of that call belongs to the
+// token that was sent, not to whatever the account holds when it lands.
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+test('an invalid_grant for the OLD token does not mark a token imported mid-refresh dead', async () => {
+  const d = deferred();
+  const m = mgr(async () => d.promise);
+  const inflight = m.ensureTokenFresh(0);
+
+  // Import lands while the refresh is in flight and hands over a valid token.
+  m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() + 3600_000 });
+  d.reject(authError(400));
+  await inflight;
+
+  const a = m.accounts[0];
+  assert.strictEqual(a._deadRefreshToken, 'rt-dead', 'the token that was SENT is the dead one');
+  assert.strictEqual(a.refreshToken, 'rt-imported');
+  assert.strictEqual(a.status, 'active', 'the account must not be locked out — its live token was never rejected');
+  assert.strictEqual(a.credential, 'at-imported');
+});
+
+test('a successful refresh of the OLD token does not overwrite tokens imported mid-refresh', async () => {
+  const d = deferred();
+  let persisted = 0;
+  const m = mgr(async () => d.promise);
+  m.onTokenRefresh(() => { persisted++; });
+  const inflight = m.ensureTokenFresh(0);
+
+  m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: 4_000_000_000_000 });
+  const persistedByImport = persisted;
+  d.resolve({ accessToken: 'at-stale', refreshToken: 'rt-stale', expiresAt: Date.now() + 3600_000 });
+  await inflight;
+
+  const a = m.accounts[0];
+  assert.strictEqual(a.refreshToken, 'rt-imported', 'the stale result is discarded');
+  assert.strictEqual(a.credential, 'at-imported');
+  assert.strictEqual(a.expiresAt, 4_000_000_000_000);
+  assert.strictEqual(persisted, persistedByImport, 'nothing stale is persisted to config');
+  assert.strictEqual(a._refreshPromise, null, 'the coalescing slot is released');
+});
+
+test('an unchanged token is refreshed normally (the guard only fires on a swap)', async () => {
+  const m = mgr(async () => ({ accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() + 3600_000 }));
+  await m.ensureTokenFresh(0);
+  assert.strictEqual(m.accounts[0].refreshToken, 'rt-new');
+  assert.strictEqual(m.accounts[0].credential, 'at-new');
+});
+
+// #315: a third-party backend's credential must never be sent to Anthropic's
+// token endpoint. The prober and warmer already skip `upstream` accounts; the
+// send path and the 401 retry go through here and did not.
+test('an account with a third-party upstream is never refreshed against Anthropic', async () => {
+  let calls = 0;
+  const m = new AccountManager([{
+    name: 'glm', type: 'oauth', upstream: 'https://glm.example/anthropic',
+    accessToken: 'third-party-key', refreshToken: 'rt-third-party', expiresAt: Date.now() - 1000,
+  }], 0.98, { refreshFn: async () => { calls++; return { accessToken: 'x', refreshToken: 'y', expiresAt: Date.now() + 1e6 }; } });
+  await m.ensureTokenFresh(0);
+  await m.ensureTokenFresh(0, true);
+  assert.strictEqual(calls, 0, 'the refresh token was not sent anywhere');
+  assert.strictEqual(m.accounts[0].credential, 'third-party-key', 'the credential is untouched');
+});

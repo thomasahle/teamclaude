@@ -12,6 +12,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateCertChain } from '../src/x509.js';
 import { createConnectHandler } from '../src/mitm.js';
+import { KEEP_ALIVE_TIMEOUT_MS } from '../src/server.js';
+import { allowLoopbackForward } from '../src/forward-target.js';
 import { AccountManager } from '../src/account-manager.js';
 
 // The MITM now TERMINATES the tunnel (real h2/h1 server) and forwards each
@@ -69,6 +71,7 @@ function makeUpstream(handler) {
 // Build the teamclaude proxy (CONNECT → terminate + forward) against `upPort`.
 function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hooks = {}, sx = null } = {}) {
   const proxy = http.createServer();
+  allowLoopbackForward(proxy); // tunnel-mode targets in these tests are on this machine
   proxy.on('connect', createConnectHandler({
     // upstream host is 127.0.0.1 so a `CONNECT 127.0.0.1:<port>` is 'rewrite' mode.
     config: { upstream: `http://127.0.0.1:${upPort}` },
@@ -512,4 +515,55 @@ test('MITM h2: a cancelled stream does not strand the request handler', { ...T, 
   assert.ok(got.returned,
     'a cancelled h2 stream left the request handler waiting on a drain or close that cannot arrive; '
     + `its activity entry never closed and the handler holds the event loop: ${JSON.stringify(got)}`);
+});
+
+// The base listener holds an idle keep-alive connection for KEEP_ALIVE_TIMEOUT_MS
+// so a client's pool is always the side that closes (see server-keepalive.test.js).
+// The MITM terminates a server of its own, and that one was left at whatever the
+// runtime defaults to: measured on node 24 it advertised no `Keep-Alive` header
+// at all while the base listener advertised `timeout=120`, and on node 26 the
+// same server closes an idle h1 connection after 6s. Half of one proxy answered
+// to a number nobody chose. Asserted on the header the client actually reads,
+// through a real tunnel, because that is what a connection pool schedules against.
+test('MITM h1: the terminating server advertises the base idle window and reuses the connection', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = makeUpstream(() => ({ status: 200, headers: { 'content-type': 'text/plain' }, body: 'ok' }));
+  const upPort = await listen(upstream);
+
+  const am = new AccountManager([oauthAccount('acct@x', 'REAL-TOKEN')], 0.98);
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['http/1.1']);
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  agent.createConnection = () => tlsSock;
+  try {
+    // Completing a keep-alive response arms Node's socket timer. On Node
+    // 24.6.0 an unset HTTP/2 keepAliveTimeoutBuffer makes that timeout NaN;
+    // reading only the advertised header does not prove the socket is reusable.
+    for (let i = 0; i < 3; i++) {
+      const { res, body, reusedSocket } = await new Promise((resolve, reject) => {
+        const r = http.request({
+          agent, method: 'POST', path: '/v1/messages',
+          headers: { 'content-type': 'application/json' },
+        }, (response) => {
+          let body = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk) => { body += chunk; });
+          response.once('error', reject);
+          response.on('end', () => resolve({ res: response, body, reusedSocket: r.reusedSocket }));
+        });
+        r.once('error', reject);
+        r.end('{"model":"x"}');
+      });
+      assert.equal(res.statusCode, 200);
+      assert.equal(body, 'ok');
+      assert.equal(reusedSocket, i > 0, 'subsequent requests must reuse the same tunnel');
+      assert.equal(res.headers['keep-alive'], `timeout=${KEEP_ALIVE_TIMEOUT_MS / 1000}`,
+        'the MITM half of the proxy must not keep its own idle window');
+    }
+  } finally {
+    agent.destroy();
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
 });

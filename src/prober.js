@@ -8,19 +8,69 @@
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
+import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
+import { providerOf } from './provider.js';
+import { fetchCodexUsage } from './codex-usage.js';
+
+// Node's timers take a 32-bit signed delay: anything above 2^31-1 ms is
+// coerced to 1 ms, so an interval large enough to mean "practically never"
+// would instead probe in a tight loop. The TUI and CLI accept any number of
+// seconds, so the ceiling lives here where the timer is armed.
+export const MAX_PROBE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function clampInterval(ms) {
+  return ms > 0 ? Math.min(ms, MAX_PROBE_INTERVAL_MS) : 0;
+}
+
+// Which accounts the probe reads, one rule per source. Exported so the status
+// payload a server builds before its Prober exists states the same answer the
+// Prober will (#512), instead of keeping a copy of the rule.
+const isAnthropicProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'anthropic'
+  && account.type === 'oauth' && !!account.credential && !account.upstream;
+
+const isCodexProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'codex'
+  && account.type === 'oauth' && !!account.credential && !!account.accountId && !account.upstream;
+
+const isBackendProbeTarget = (/** @type {any} */ account) => !!account?.credential && hasBackendQuota(account);
+
+/**
+ * True when the quota probe has something to read for this account: an
+ * Anthropic or Codex subscription, or a third-party backend that publishes a
+ * quota of its own. Anything else reads `not-applicable` in the probe status.
+ * @param {any} account
+ * @returns {boolean}
+ */
+export function probeApplicable(account) {
+  return isAnthropicProbeTarget(account) || isCodexProbeTarget(account) || isBackendProbeTarget(account);
+}
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, timeoutMs = 10_000, log = console.log } = {}) {
+  // `log` resolves the console per call rather than capturing it. A default
+  // parameter is evaluated when the constructor runs, and the server builds its
+  // prober in the same tick as `server.listen()` — before the listen callback
+  // reaches `tui.start()`, which swaps `console.log` for the activity log. The
+  // notices below are produced later still, by a reload that changes the probe
+  // interval, so a captured `console.log` would put them on a terminal the
+  // alternate screen has already covered.
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, reloginCheck = true, log = (/** @type {string} */ line) => console.log(line) } = {}) {
     this.am = accountManager;
-    this.intervalMs = intervalMs;
+    this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
+    this.codexProbeFn = codexProbeFn;
+    this.profileFn = profileFn;
+    this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
+    // Whether each pass starts with the re-login check (config `reloginCheck`,
+    // on unless set to false): every OAuth token due within the hour is
+    // refreshed first, so an account whose refresh token has died is marked
+    // before a request fails on it — see AccountManager.refreshExpiringTokens.
+    this.reloginCheck = reloginCheck;
     this.log = log;
     this.timer = null;
     this._running = false;
     this.lastRunStartedAt = null;
     this.lastRunFinishedAt = null;
-    this.nextRunAt = intervalMs > 0 ? Date.now() + intervalMs : null;
+    this.nextRunAt = this.intervalMs > 0 ? Date.now() + this.intervalMs : null;
     this.accountStatus = new Map();
   }
 
@@ -31,6 +81,7 @@ export class Prober {
   /** Change interval at runtime (0 = off). Probes once immediately when on. */
   reschedule(intervalMs) {
     const wasOn = this.intervalMs > 0 && this.timer;
+    intervalMs = clampInterval(intervalMs);
     this.intervalMs = intervalMs;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
 
@@ -60,7 +111,15 @@ export class Prober {
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
-      const accounts = this.am.accounts.filter(account => account.type === 'oauth' && account.credential);
+      // Before the reads, so an account the check marks `error` is left out
+      // of this pass by _probeable rather than probed with a token that cannot
+      // be refreshed. The manager is a stand-in without the method in some
+      // embedders' tests; the check is then simply not run.
+      if (this.reloginCheck && typeof this.am.refreshExpiringTokens === 'function') {
+        await this.am.refreshExpiringTokens().catch(() => {});
+      }
+      const accounts = this.am.accounts.filter(account =>
+        this._probeable(account) && (this._isProbeTarget(account) || this._isCodexProbeTarget(account) || this._isBackendTarget(account)));
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -68,16 +127,59 @@ export class Prober {
     }
   }
 
+  /**
+   * Whether this account has Anthropic subscription usage to read.
+   *
+   * `/api/oauth/usage` is Anthropic's own endpoint, and its URL is fixed — a
+   * third-party backend account (`upstream` set) carries a DIFFERENT provider's
+   * key, which the probe would send to api.anthropic.com every cycle. That
+   * leaks the key to a party it was never issued for, and the answer it gets
+   * back (429) is recorded as a permanent probe error against an account that
+   * is serving traffic perfectly well. The keep-warm scheduler already draws
+   * this line (warmer.js `_isWarmTarget`); the probe did not.
+   */
+  _isProbeTarget(account) {
+    return isAnthropicProbeTarget(account);
+  }
+
+  _isCodexProbeTarget(account) {
+    return isCodexProbeTarget(account);
+  }
+
+  /** A third-party backend that publishes a quota of its own. The provider
+   * module decides which; nothing in this file knows one by name. */
+  _isBackendTarget(account) {
+    return isBackendProbeTarget(account);
+  }
+
+  // Only accounts in rotation are probed. A probe forces a token refresh and
+  // sends the access token upstream, and neither belongs to an account the
+  // operator took out of service (`disabled`) or one whose refresh token upstream
+  // has already rejected — refreshing it again only rotates the token family
+  // once more, and its access token cannot be trusted either. The manager's
+  // dead-token guard is keyed on the token value, so a re-login lifts this skip
+  // on its own.
+  _probeable(account) {
+    if (!account?.credential) return false;
+    if (account.disabled) return false;
+    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return false;
+    return true;
+  }
+
   async probeAccount(account) {
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
+    // A third-party backend has no Anthropic usage to read; it publishes its own
+    // figure, or none. Same schedule, same status row, different source.
+    if (this._isBackendTarget(account)) return this._probeBackend(account, startedAt);
+    if (this._isCodexProbeTarget(account)) return this._probeCodex(account, startedAt);
     try {
       await this.am.ensureTokenFresh(account.index);
-      let usage = await this._withTimeout(this.probeFn(account.credential));
+      let usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null));
       if (usage?.status === 401) {
         // Token rejected: force refresh and retry once.
         await this.am.ensureTokenFresh(account.index, true);
-        usage = await this._withTimeout(this.probeFn(account.credential));
+        usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null));
       }
 
       if (!usage || usage.error) {
@@ -93,6 +195,12 @@ export class Prober {
       }
 
       this.am.applyUsageData(account.index, usage);
+      const missingTier = !account.rateLimitTier && !account.seatTier
+        && account.hasClaudeMax == null && account.hasClaudePro == null;
+      if (missingTier && this.profileFn) {
+        const profile = await this._withTimeout(this.profileFn(account.credential, account.routing ?? null));
+        this.am.applyProfileData(account.index, profile);
+      }
       const finishedAt = Date.now();
       this._recordAccount(account, {
         status: 'ok',
@@ -113,6 +221,43 @@ export class Prober {
     }
   }
 
+  async _probeCodex(account, startedAt) {
+    try {
+      await this.am.ensureTokenFresh(account.index);
+      let usage = await this._withTimeout(this.codexProbeFn(account));
+      if (usage?.status === 401) {
+        await this.am.ensureTokenFresh(account.index, true);
+        usage = await this._withTimeout(this.codexProbeFn(account));
+      }
+      if (!usage || usage.error) {
+        const finishedAt = Date.now();
+        this._recordAccount(account, { status: usage?.error ? 'error' : 'timeout', error: usage?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
+        return;
+      }
+      this.am.applyCodexUsageData(account.index, usage);
+      const finishedAt = Date.now();
+      this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
+    } catch (err) {
+      const finishedAt = Date.now();
+      this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
+    }
+  }
+
+  /** Read one backend account's own quota through the provider module. */
+  async _probeBackend(account, startedAt) {
+    const reading = await this.backendFn(account, { timeoutMs: this.timeoutMs })
+      .catch(err => ({ error: err?.message || String(err) }));
+    const finishedAt = Date.now();
+    const failure = reading && 'error' in reading ? reading.error : null;
+    const failed = !reading || !!failure;
+    if (!failed) this.am.applyBackendQuota(account.index, reading);
+    this._recordAccount(account, {
+      status: failed ? 'error' : 'ok',
+      error: failed ? (failure || 'no reading') : null,
+      startedAt, finishedAt, durationMs: finishedAt - startedAt,
+    });
+  }
+
   getStatus() {
     return {
       enabled: this.intervalMs > 0,
@@ -125,7 +270,7 @@ export class Prober {
         const status = this.accountStatus.get(account.name);
         return {
           name: account.name,
-          status: account.type === 'oauth' ? (status?.status || 'never') : 'not-applicable',
+          status: probeApplicable(account) ? (status?.status || 'never') : 'not-applicable',
           lastProbedAt: iso(status?.finishedAt),
           startedAt: iso(status?.startedAt),
           durationMs: status?.durationMs ?? null,

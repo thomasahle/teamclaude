@@ -12,14 +12,37 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
   am.accounts[0].quota.unified7d = 0.42;
   const [entry] = am.exportQuotaState();
 
-  assert.deepEqual(Object.keys(entry).sort(), ['accountUuid', 'name', 'orgName', 'orgUuid', 'quota'].sort());
+  // `provider` and `accountId` are identity, not credentials: they are what
+  // identifies an account that has no Anthropic uuid to be matched by.
+  assert.deepEqual(
+    Object.keys(entry).sort(),
+    // `outsideSpend` is learned state like `adaptive` (#475): per-window sums,
+    // never a token or an activity stamp.
+    ['accountUuid', 'accountId', 'userId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive', 'outsideSpend'].sort(),
+  );
   assert.equal(entry.accountUuid, 'p1');
+  assert.equal(entry.provider, 'anthropic');
   assert.equal(entry.quota.unified7d, 0.42);
   // Transient/credential fields must not leak.
   assert.ok(!('probing' in entry.quota));
   assert.ok(!('rateLimitedUntil' in entry.quota));
   assert.ok(!('credential' in entry));
   assert.ok(!('accessToken' in entry));
+});
+
+test('adaptive burn and concurrency learning survive an identity-matched restart', () => {
+  const am1 = new AccountManager([oauth('a', { accountUuid: 'p1' })], 0.98);
+  const t0 = Date.now();
+  am1.burnRateLearner.observeUtilization(0, 'unified7d', 0.10, t0);
+  am1.burnRateLearner.observeUtilization(0, 'unified7d', 0.20, t0 + 5 * 60_000);
+  am1.concurrencyLearner.caps.set(0, 3.5);
+  const reserve = am1.burnRateLearner.reserve(0, 'unified7d');
+
+  const am2 = new AccountManager([oauth('a', { accountUuid: 'p1' })], 0.98);
+  am2.restoreQuotaState(am1.exportQuotaState());
+
+  assert.equal(am2.burnRateLearner.reserve(0, 'unified7d'), reserve);
+  assert.equal(am2.concurrencyLearner.cap(0), 3.5);
 });
 
 test('quota survives an export → restore round-trip', () => {
@@ -34,6 +57,21 @@ test('quota survives an export → restore round-trip', () => {
   assert.equal(am2.accounts[0].quota.unified7d, 0.6);
   assert.equal(am2.accounts[0].quota.unified7dReset, future);
   assert.equal(am2.accounts[0].probing, false); // weekly window known → not probing
+});
+
+test('quota tier metadata survives an export → restore round-trip', () => {
+  const am1 = new AccountManager([oauth('a', {
+    accountUuid: 'p1', organizationType: 'claude_team',
+    rateLimitTier: 'default_raven', seatTier: 'team_standard',
+  })], 0.98);
+  const saved = am1.exportQuotaState();
+  const am2 = new AccountManager([oauth('a', { accountUuid: 'p1' })], 0.98);
+
+  am2.restoreQuotaState(saved);
+
+  assert.equal(am2.accounts[0].organizationType, 'claude_team');
+  assert.equal(am2.accounts[0].rateLimitTier, 'default_raven');
+  assert.equal(am2.accounts[0].seatTier, 'team_standard');
 });
 
 test('restore matches by identity, not array position', () => {

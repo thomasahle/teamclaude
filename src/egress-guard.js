@@ -19,8 +19,14 @@ const POLL_MS = 3_000;
 
 export class EgressGuard {
   /**
-   * @param {object} opts
-   * @param {string|string[]} opts.pin  'auto' (pin whatever is seen first), or one or more allowed IPs
+   * @param {Object} [opts]
+   * @param {string|string[]} [opts.pin]  'auto' (pin whatever is seen first), or one or more allowed IPs
+   * @param {string} [opts.checkUrl]  what to ask for the egress address
+   * @param {number} [opts.ttlMs]
+   * @param {number} [opts.holdMs]
+   * @param {Function} [opts.fetchImpl]
+   * @param {number} [opts.pollMs]
+   * @param {(line: string) => void} [opts.log]
    */
   constructor({ pin, checkUrl = DEFAULT_CHECK_URL, ttlMs = DEFAULT_TTL_MS, holdMs = DEFAULT_HOLD_MS,
     fetchImpl = fetch, pollMs = POLL_MS, log = () => {} } = {}) {
@@ -80,14 +86,22 @@ export class EgressGuard {
     return this._inFlight;
   }
 
-  /** Is `ip` one of the pinned addresses? Unknown (null) counts as allowed. */
+  /**
+   * Is `ip` one of the pinned addresses? Unknown (null) counts as allowed.
+   *
+   * @param {string|null|undefined} ip
+   */
   matches(ip) {
     if (!ip) return true;
     const allowed = this.allowed();
     return allowed.length === 0 || allowed.includes(ip);
   }
 
-  /** One check against the pin: { ok, ip, expected }. */
+  /**
+   * One check against the pin: { ok, ip, expected }.
+   *
+   * @param {{ force?: boolean }} [opts]
+   */
   async check(opts) {
     const ip = await this.currentIp(opts);
     return { ok: this.matches(ip), ip, expected: this.allowed() };
@@ -118,7 +132,12 @@ export class EgressGuard {
   }
 }
 
-/** Build a guard from config, or null when the feature is not configured. */
+/**
+ * Build a guard from config, or null when the feature is not configured.
+ *
+ * @param {Record<string, any>|null|undefined} config
+ * @param {(line: string) => void} log
+ */
 export function createEgressGuard(config, log) {
   const cfg = config?.egress;
   if (!cfg?.pin) return null;

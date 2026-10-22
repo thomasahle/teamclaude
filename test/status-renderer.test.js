@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderStatus } from '../src/status-renderer.js';
+import { renderStatus, showSessionRow } from '../src/status-renderer.js';
+import { renderDashboardHtml } from '../src/dashboard.js';
 
 const now = Date.parse('2026-07-03T12:00:00Z');
 
@@ -35,6 +36,70 @@ test('renderStatus prints core status', () => {
   assert.match(output, /2 req, 1.5k tok/);
 });
 
+// A subscription that meters no session window says so (sessionWindowStated
+// false); an empty Session row would read as "unknown" for something that does
+// not exist.
+test('renderStatus leaves out the Session row for a plan with no session window', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: null, unified7d: 0.4, unified7dReset: now + 86_400_000, sessionWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.doesNotMatch(output, /Session/);
+  assert.match(output, /Weekly\s+\[/);
+});
+
+test('renderStatus still draws a Session reading the plan flag says it lacks', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: 0.99, unified5hReset: now + 3_600_000, unified7d: 0.1, unified7dReset: now + 86_400_000, sessionWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Session\s+\[.*\] 99%/);
+});
+
+test('renderStatus shows an OAuth entitlement cooldown separately from account status', () => {
+  const status = sampleStatus();
+  status.accounts[0].entitlementDeniedUntil = new Date(now + 4 * 60_000).toISOString();
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /active \/ entitlement cooldown 4m/);
+});
+
+test('renderStatus describes a timezone-aware reset warm-up schedule', () => {
+  const status = sampleStatus();
+  status.warm = {
+    enabled: true,
+    mode: 'reset',
+    timezone: 'Europe/Moscow',
+    resetTime: '15:30',
+    warmupTime: '10:30',
+    nextWarmupAt: '2026-07-04T07:30:00Z',
+    accounts: [],
+  };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /Keep-warm\s+daily 10:30 Europe\/Moscow → reset 15:30, next/);
+  assert.doesNotMatch(output, /on every 0s/);
+});
+
+test('renderStatus describes a rolling five-hour warm-up schedule', () => {
+  const status = sampleStatus();
+  status.warm = {
+    enabled: true,
+    mode: 'rolling',
+    timezone: 'Europe/Moscow',
+    resetTime: '15:30',
+    anchorResetAt: '2026-07-03T12:30:00Z',
+    cadenceSeconds: 18_000,
+    nextWarmupAt: '2026-07-03T12:30:00Z',
+    nextTargetResetAt: '2026-07-03T17:30:00Z',
+    accounts: [],
+  };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /Keep-warm\s+rolling every 5h, reset anchor 15:30 Europe\/Moscow, next/);
+  assert.doesNotMatch(output, /on every 0s/);
+});
+
 test('renderStatus shows the sessions line and per-account session count when present', () => {
   const status = sampleStatus();
   status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true };
@@ -42,6 +107,20 @@ test('renderStatus shows the sessions line and per-account session count when pr
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /Sessions\s+2 active \/ 3 known · distributing/);
   assert.match(output, /a \(oauth, prio 0\).*2 sess/);
+});
+
+test('renderStatus reports a draining distribution toggle instead of single-account', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: false, draining: 2 };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · draining 2/);
+});
+
+test('renderStatus says single-account once the drain has finished', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: false, draining: 0 };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · single-account/);
 });
 
 test('renderStatus omits the sessions line when the status has no sessions field', () => {
@@ -78,6 +157,40 @@ test('renderStatus shows per-model eligibility when a family is metered separate
 test('renderStatus omits the Models line for accounts with no family-specific bucket', () => {
   const output = renderStatus(sampleStatus(), { color: false, now });
   assert.doesNotMatch(output, /Models/);
+});
+
+// The Models row used to judge every bucket against one flat number (the
+// account's resolved `default`), so a per-account table that overrides only
+// unified7dFable never reached this row: Fable read ✓ at 60% against the
+// fleet's 98% default even though the router itself (thresholdFor(bucket,
+// account)) was already refusing it at the account's own 50% Fable wall.
+test('the Models row judges each bucket against the account\'s OWN threshold for that bucket (#409)', () => {
+  const status = sampleStatus();
+  status.accounts[0].switchThreshold = { unified7dFable: 0.5 };
+  status.accounts[0].quota = {
+    unified5h: 0.2, unified5hReset: now + 60_000,
+    unified7d: 0.3, unified7dReset: now + 600_000,
+    // Under the fleet's 98% default, but over the account's own 50% Fable wall.
+    unified7dFable: 0.6, unified7dFableReset: now + 86_400_000,
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Models\s+Opus ✓/);   // Opus still judges against the fleet's default
+  assert.match(output, /Fable ✗/);           // Fable judges against the account's own override
+});
+
+test('a bucket the account does not override still judges against the fleet value', () => {
+  const status = sampleStatus();
+  status.accounts[0].switchThreshold = { unified7dFable: 0.99 }; // Fable only
+  status.accounts[0].quota = {
+    unified5h: 0.2, unified5hReset: now + 60_000,
+    // unified7d carries no account override: at 90% it is under the fleet's
+    // 98% default, which is the number it must still be judged against.
+    unified7d: 0.9, unified7dReset: now + 600_000,
+    unified7dFable: 0.3, unified7dFableReset: now + 86_400_000,
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Models\s+Opus ✓/); // judged against the fleet's 98%, not the account's Fable-only 99%
+  assert.match(output, /Fable ✓/);         // 30% is well under the account's own 99% Fable wall
 });
 
 test('renderStatus prints the routing table with configured and auto routes', () => {
@@ -125,6 +238,53 @@ test('renderStatus sanitizes probe errors', () => {
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /bad red/);
   assert.doesNotMatch(output, /\x1b\[31m/);
+});
+
+test('renderStatus prints configured usage dimensions and sanitizes their labels', () => {
+  const status = sampleStatus();
+  status.usageDimensions = {
+    project: {
+      'KarpelesLab/teamclaude': { requests: 2, inputTokens: 1000, outputTokens: 250, lastUsed: '2026-07-03T11:59:00Z' },
+    },
+    'bad\x1b[31mname': {
+      'value\nred': { requests: 1, inputTokens: 1, outputTokens: 1 },
+    },
+  };
+
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Project usage/);
+  assert.match(output, /KarpelesLab\/teamclaude\s+2 req, 1.0k in \/ 250 out, last 1m ago/);
+  assert.match(output, /Bad name usage/);
+  assert.match(output, /value red/);
+  assert.doesNotMatch(output, /\x1b\[31m/);
+});
+
+test('renderStatus shows a client\'s WebSocket connections apart from its requests', () => {
+  const status = sampleStatus();
+  status.clients = {
+    alice: { requests: 2, connections: 1, inputTokens: 1000, outputTokens: 250, lastUsed: '2026-07-03T11:59:00Z' },
+    bob: { requests: 1, connections: 0, inputTokens: 10, outputTokens: 5 },
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /alice\s+2 req, 1 ws, 1.0k in \/ 250 out, last 1m ago/);
+  assert.match(output, /bob\s+1 req, 10 in \/ 5 out/, 'no channel, no column');
+});
+
+test('renderStatus never grows a per-session section', () => {
+  // Sessions are unbounded caller-supplied ids: a terminal renderer that
+  // printed one line each would bury the whole status readout. The per-session
+  // view is the dashboard's (behind proxy.sessionDetail), not the CLI's.
+  const status = sampleStatus();
+  status.sessions = {
+    known: 3, active: 2, perAccount: {},
+    items: Array.from({ length: 300 }, (_, i) => ({
+      id: `session-${i}`, client: 'alice', dimensions: { project: 'p' },
+      requests: 1, lastSeen: 0, firstSeen: 0, active: true, inFlight: 0, pins: {}, tokens: {},
+    })),
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.doesNotMatch(output, /Session usage|Sessions usage/);
+  assert.doesNotMatch(output, /session-0/);
 });
 
 // --- blocklist visibility (issue: a blocked model read as available) ---------
@@ -198,4 +358,272 @@ test('renderStatus still lists accounts for a route the blocklist does not cover
   }];
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /\*sonnet\*\s+→ a \(auto\)/);
+});
+
+// ── per-account usage caps (accounts[].maxUsage) ──────────────
+
+function cappedStatus(quota, maxUsage) {
+  return {
+    currentAccount: 'a',
+    switchThreshold: 0.98,
+    accounts: [{
+      name: 'a', type: 'oauth', priority: 0, status: 'active',
+      quota, maxUsage, usage: {},
+    }],
+  };
+}
+
+test('renderStatus marks the cap on the bar and names it', () => {
+  const out = renderStatus(cappedStatus({ unified5h: 0.1, unified7d: 0.1 },
+    { unified5h: 0.6, unified7d: 0.6 }), { color: false, now });
+  // The mark sits where the bar may not pass, and the number says which percent
+  // it is — one cell is ~6%, so the mark alone cannot tell 60% from 61%.
+  assert.match(out, /Session\s+\[██░░░░░░░░░┃░░░░░░\] 10% cap 60%/);
+});
+
+test('a capped bar is the same width as an uncapped one', () => {
+  const capped = renderStatus(cappedStatus({ unified7d: 0.1 }, { unified7d: 0.6 }), { color: false, now });
+  const plain = renderStatus(cappedStatus({ unified7d: 0.1 }, null), { color: false, now });
+  const width = out => out.match(/Weekly\s+\[([^\]]*)\]/)[1].length;
+  assert.equal(width(capped), width(plain));   // rows still line up
+  assert.doesNotMatch(plain, /cap /);          // and nothing is drawn without a cap
+});
+
+test('an uncapped bucket on a capped account is left alone', () => {
+  const out = renderStatus(cappedStatus({ unified5h: 0.1, unified7d: 0.1 },
+    { unified7d: 0.6 }), { color: false, now });
+  assert.match(out, /Session\s+\[██░░░░░░░░░░░░░░░░\] 10%$/m);
+  assert.match(out, /Weekly\s+.*cap 60%/);
+});
+
+test('a family over its cap reads ✗ while the others keep serving', () => {
+  const out = renderStatus(cappedStatus(
+    { unified5h: 0.1, unified7d: 0.1, unified7dFable: 0.85 },
+    { unified7d: 0.6, unified7dFable: 0.8 }), { color: false, now });
+  assert.match(out, /Models\s+Opus ✓\s+Fable ✗/);
+});
+
+// The shared weekly bucket meters family spend too, so a cap on it stops every
+// family — the Models line must not advertise one as available.
+test('a shared weekly cap marks every family unavailable', () => {
+  const out = renderStatus(cappedStatus(
+    { unified5h: 0.1, unified7d: 0.62, unified7dFable: 0.1 },
+    { unified7d: 0.6, unified7dFable: 0.8 }), { color: false, now });
+  assert.match(out, /Models\s+Opus ✗\s+Fable ✗/);
+});
+
+test('the blocked line names the cap as the reason', () => {
+  const status = cappedStatus({ unified7d: 0.7 }, { unified7d: 0.6 });
+  status.accounts[0].unavailable = 'capped';
+  assert.match(renderStatus(status, { color: false, now }), /Blocked\s+account usage cap reached \(maxUsage\)/);
+});
+
+// ── per-account switch threshold (accounts[].switchThreshold, #409) ────────
+
+function thresholdedStatus(switchThreshold, fleetSwitchThreshold = 0.98, switchThresholds = null) {
+  return {
+    currentAccount: 'a',
+    switchThreshold: fleetSwitchThreshold,
+    switchThresholds,
+    accounts: [
+      { name: 'a', type: 'oauth', priority: 0, status: 'active', quota: {}, usage: {}, switchThreshold: null },
+      { name: 'b', type: 'oauth', priority: 0, status: 'active', quota: {}, usage: {}, switchThreshold },
+    ],
+  };
+}
+
+test('a per-account switchThreshold that differs from the fleet gets its own line', () => {
+  const out = renderStatus(thresholdedStatus(1.0), { color: false, now });
+  assert.match(out, /Switch\s+switch at 100%/);
+  // The unmodified account is silent — the diff, not the config, earns the line.
+  assert.doesNotMatch(out.split('b (oauth')[0], /Switch\s+switch/);
+});
+
+test('an override that merely repeats the fleet value stays silent', () => {
+  const out = renderStatus(thresholdedStatus(0.98), { color: false, now });
+  assert.doesNotMatch(out, /Switch\s+switch/);
+});
+
+test('a per-bucket table names only the buckets that actually differ', () => {
+  const out = renderStatus(thresholdedStatus({ unified7d: 0.9, unified7dFable: 0.8 }), { color: false, now });
+  assert.match(out, /Switch\s+switch 7d 90%, fable 80%/);
+});
+
+test('a table entry matching the fleet\'s own per-bucket override is left out', () => {
+  const out = renderStatus(thresholdedStatus(
+    { unified7d: 0.9, unified7dFable: 0.7 }, 0.98, { default: 0.98, unified7d: 0.9 },
+  ), { color: false, now });
+  // unified7d (0.9) matches the fleet's own unified7d (0.9) — silent; Fable
+  // (0.7) differs from the fleet's default (0.98) — shown.
+  assert.match(out, /Switch\s+switch fable 70%/);
+  assert.doesNotMatch(out, /7d 90%/);
+});
+
+test('an invalid override (array, #425 hazard class) is refused, not shown', () => {
+  const out = renderStatus(thresholdedStatus([0.5]), { color: false, now });
+  assert.doesNotMatch(out, /Switch\s+switch/);
+});
+
+// ── The Active/Serving row under session distribution ───────────────────────
+//
+// `currentAccount` is the rotation cursor. Under ADAPTIVE distribution the
+// picker never moves it, so it names where a SESSION-LESS request would go —
+// not what is serving. Reporting it as "Active" pointed at one account while
+// several were running. Even distribution still walks from the cursor, so it
+// keeps the plain Active row.
+
+function distributedStatus(mode) {
+  return {
+    currentAccount: 'a',
+    switchThreshold: 0.98,
+    sessions: { active: 12, known: 12, distribute: mode !== 'off', mode },
+    accounts: [
+      { name: 'a', type: 'oauth', priority: 0, status: 'active', sessions: 3, quota: {}, usage: {} },
+      { name: 'b', type: 'oauth', priority: 0, status: 'active', sessions: 9, quota: {}, usage: {} },
+      { name: 'c', type: 'oauth', priority: 0, status: 'active', sessions: 0, quota: {}, usage: {} },
+    ],
+  };
+}
+
+test('distribution off: the cursor is the active account, as before', () => {
+  const s = distributedStatus('off');
+  const out = renderStatus(s, { color: false, now });
+  assert.match(out, /^Active {7}a$/m);
+  assert.doesNotMatch(out, /^Serving/m);
+  // Only the cursor is marked.
+  assert.match(out, /^> a \(oauth/m);
+  assert.match(out, /^ {2}b \(oauth/m);
+});
+
+test('distributing: the row names every account actually serving, plus the cursor', () => {
+  const out = renderStatus(distributedStatus('adaptive'), { color: false, now });
+  assert.doesNotMatch(out, /^Active/m);
+  // Busiest first, each with its session count, and the cursor named as such.
+  assert.match(out, /^Serving {6}b 9 · a 3 {2}cursor a$/m);
+});
+
+test('distributing: the marker follows the sessions, not the cursor', () => {
+  const out = renderStatus(distributedStatus('adaptive'), { color: false, now });
+  assert.match(out, /^> a \(oauth/m, 'a carries sessions');
+  assert.match(out, /^> b \(oauth/m, 'b carries sessions and is NOT the cursor');
+  assert.match(out, /^ {2}c \(oauth/m, 'c carries none');
+});
+
+test('distributing but idle: says so rather than implying the cursor is serving', () => {
+  const s = distributedStatus('adaptive');
+  for (const a of s.accounts) a.sessions = 0;
+  const out = renderStatus(s, { color: false, now });
+  assert.match(out, /^Serving {6}idle cursor a$/m);
+});
+
+test('even mode keeps the Active row and the cursor marker', () => {
+  const out = renderStatus(distributedStatus('even'), { color: false, now });
+  assert.match(out, /^Active {7}a$/m);
+  assert.doesNotMatch(out, /^Serving/m);
+  assert.match(out, /^> a \(oauth/m, 'the cursor is marked');
+  assert.match(out, /^ {2}b \(oauth/m, 'b carries sessions but is not the cursor');
+});
+
+test('adaptive diagnostics name the next target, score weight, and family split', () => {
+  const s = distributedStatus('adaptive');
+  s.accounts[0].sessionsByBucket = { unified7d: 2, unified7dFable: 1 };
+  s.adaptive = [{
+    name: 'a', bucket: 'unified7d', window: 'unified7d', competing: true,
+    next: true, weight: 0.6, sessions: 3, inFlight: 1,
+    headroom: 0.28, threshold: 0.98, planWeight: 20, concCap: 6,
+  }];
+  const out = renderStatus(s, { color: false, now });
+  assert.match(out, /^> a .*3 sess \(opus\+ 2, fable 1\)$/m);
+  assert.match(out, /Adaptive\s+next · weight 60% of opus\+/);
+  assert.match(out, /plan 20x/);
+});
+
+// The adaptive rows come off the wire like everything else. An older server
+// omits fields and a hostile one sends strings where numbers belong; neither
+// may throw inside `teamclaude status` or reach the terminal unstripped.
+test('a hostile adaptive row renders as ? fields, not a throw or an escape', () => {
+  const CLIP = '\x1b]52;c;aGVsbG8=\x07';
+  const s = distributedStatus('adaptive');
+  s.accounts[0].name = `a${CLIP}`;
+  // A string count and a NaN are dropped; the escaped key is stripped.
+  s.accounts[0].sessionsByBucket = { [`unified7d\x1b[2J`]: 2, unified7dFable: 1, other: '9', bad: NaN };
+  s.adaptive = [
+    null,
+    'garbage',
+    {
+      name: `a${CLIP}`, bucket: `opus\x1b[2Jforged`, window: `w\r\n`, competing: true,
+      next: 'yes', weight: 'lots', sessions: '3', inFlight: null,
+      headroom: Infinity, threshold: undefined, planWeight: 'x', concCap: '6',
+    },
+  ];
+  let out;
+  assert.doesNotThrow(() => { out = renderStatus(s, { color: false, now }); });
+  assert.doesNotMatch(out, /[\x1b\x07\x9b\r]/);
+  assert.match(out, /Adaptive\s+next · weight \? of opus forged/);
+  assert.match(out, /\? sess \/ \? inflight/);
+  assert.match(out, /head \? of \?/);
+  assert.match(out, /plan \?x/);
+  assert.match(out, /conc \?/);
+  assert.match(out, /^> a .*3 sess \(unified7d 2, fable 1\)$/m);
+});
+
+test('accounts are listed in priority order, not config order', () => {
+  const acct = (name, priority) => ({ name, type: 'oauth', status: 'active', priority, quota: {}, usage: {} });
+  const out = renderStatus({
+    currentAccount: 'first',
+    switchThreshold: 0.98,
+    // Config order puts the last-resort account second, which is how it reached
+    // the payload and how it used to render.
+    accounts: [acct('first', -1), acct('last-resort', 300), acct('fallback', 100)],
+  }, { color: false, now });
+
+  const order = out.split('\n').filter(l => /\(oauth, prio/.test(l))
+    .map(l => l.trim().replace(/^>\s*/, '').split(' ')[0]);
+  assert.deepEqual(order, ['first', 'fallback', 'last-resort']);
+});
+
+// Every account and route string in the payload can have come off the wire
+// (`teamclaude status` against a running server) or out of an OAuth reply, and
+// the output is printed straight to the operator's terminal.
+test('renderStatus strips control characters out of account and route strings', () => {
+  const CLIP = '\x1b]52;c;aGVsbG8=\x07';
+  const status = sampleStatus();
+  status.currentAccount = `a${CLIP}`;
+  status.accounts[0].name = `a${CLIP}`;
+  status.accounts[0].orgName = `Org\x1b[2J\r\nforged`;
+  status.accounts[0].type = `oauth\x9b2J`;
+  status.accounts[0].status = `weird${CLIP}`;
+  status.accounts[0].unavailable = `custom\x1b[2Jreason`;
+  status.accounts[0].quota.spend = { enabled: false, usedMinor: 500, currency: 'USD', disabledReason: `out\x1b[2J` };
+  status.probe.accounts[0].status = `boom${CLIP}`;
+  status.routes = [{
+    name: 'r', match: [`*fable*${CLIP}`], bucket: `b\x1b[2J`, pinned: `a${CLIP}`,
+    accounts: [{ name: `a${CLIP}`, eligible: true }, { name: `b\x1b[2J`, eligible: false }],
+  }];
+
+  const output = renderStatus(status, { color: false, now });
+  assert.doesNotMatch(output, /[\x1b\x07\x9b\r]/);
+  assert.match(output, /^> a /m);           // still marked current after stripping
+  assert.match(output, /Blocked\s+custom/);
+  assert.match(output, /pinned: a/);
+  assert.equal(output.split('\n').filter(l => /forged/.test(l)).length, 1);   // no forged line
+});
+
+// #511: status, the TUI row and the dashboard card all ask this one function,
+// so they cannot disagree about a plan with no session window.
+test('showSessionRow hides the row only for a plan with no session window and no reading', () => {
+  assert.equal(showSessionRow({ sessionWindowStated: false, unified5h: null }), false);
+  assert.equal(showSessionRow({ sessionWindowStated: false }), false);
+  assert.equal(showSessionRow({ sessionWindowStated: false, unified5h: 0.99 }), true, 'a reading still present is drawn');
+  assert.equal(showSessionRow({ sessionWindowStated: false, unified5h: 0 }), true, 'zero is a reading');
+  assert.equal(showSessionRow({ sessionWindowStated: true, unified5h: null }), true);
+  assert.equal(showSessionRow({ unified5h: null }), true, 'an account that has not said keeps the row');
+  assert.equal(showSessionRow(null), true);
+});
+
+test('the dashboard card draws its Session row by the same rule', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes(showSessionRow.toString()), 'the page carries the shared helper');
+  assert.match(html, /if \(showSessionRow\(q\)\) card\.appendChild\(quotaRow\('Session'/);
+  assert.doesNotMatch(html, /^\s*card\.appendChild\(quotaRow\('Session'/m, 'no unconditional Session row is left');
 });

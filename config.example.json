@@ -1,12 +1,32 @@
 {
   "proxy": {
     "port": 3456,
-    "apiKey": "tc-change-me-to-a-secret"
+    "apiKey": "tc-change-me-to-a-secret",
+    "clientKeys": [
+      { "name": "laptop", "key": "tc-laptop-own-secret" },
+      { "name": "build-box", "key": "tc-build-box-own-secret" }
+    ],
+    "usageDimensions": [
+      { "name": "project", "header": "x-teamclaude-project" },
+      { "name": "ref", "header": "x-teamclaude-ref" }
+    ],
+    "sessionDetail": false,
+    "mcp": "off"
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
+  "stripOverageHeaders": false,
+  "synthesizeQuotaHeaders": false,
+  "distributeSessions": false,
+  "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
+  "autoRedeemResets": false,
+  "expiryRouting": {
+    "enabled": false,
+    "tolerance": 1.5,
+    "preempt": true
+  },
   "accounts": [
     {
       "name": "primary-max",
@@ -22,6 +42,19 @@
       "priority": 0,
       "accessToken": "sk-ant-oat01-your-access-token",
       "refreshToken": "sk-ant-ort01-your-refresh-token"
+    },
+    {
+      "name": "waffles@waffle.com",
+      "type": "oauth",
+      "accessToken": "sk-ant-oat01-your-access-token",
+      "refreshToken": "sk-ant-ort01-your-refresh-token",
+      "routing": "socks5h://alice:s3cret@proxy.example.com:1080"
+    },
+    {
+      "name": "codex@example.com",
+      "type": "oauth",
+      "provider": "codex",
+      "priority": 0
     },
     {
       "name": "api-fallback",

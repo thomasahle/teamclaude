@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import net from 'node:net';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile } from 'node:fs/promises';
@@ -9,6 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
+import { closedPort } from '../test-helpers/spawn-server.js';
 
 // `teamclaude switch` drives the real control endpoint, so these run the CLI
 // against a real proxy server rather than a stubbed one.
@@ -22,17 +22,6 @@ const ACCTS = [
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
-}
-
-// A port nothing is listening on: bind one, learn its number, give it back.
-function closedPort() {
-  return new Promise(resolve => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
 }
 
 async function writeConfig(port) {
@@ -52,9 +41,9 @@ async function writeConfig(port) {
   return path;
 }
 
-function runCli(configPath, cliArgs) {
+function runCli(configPath, cliArgs, extraEnv = {}) {
   const child = spawn(process.execPath, [cliPath, ...cliArgs], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -223,5 +212,24 @@ test('a down server exits 1 with the same hint as status', async () => {
     assert.equal(res.code, 1, cliArgs.join(' '));
     assert.match(res.stderr, new RegExp(`Cannot connect to proxy at localhost:${port}`));
     assert.match(res.stderr, /Is the server running\?/);
+  }
+});
+
+// Accepted-but-never-answered is not "down": it is the shape of a stalled or
+// overloaded server, and the command must say so within its deadline rather
+// than hang.
+test('status diagnoses an accepted connection whose server never answers', async () => {
+  const silent = http.createServer(() => { /* accept and intentionally hang */ });
+  const port = await listen(silent);
+  const configPath = await writeConfig(port);
+  try {
+    const res = await runCli(configPath, ['status'], { TEAMCLAUDE_STATUS_TIMEOUT_MS: '100' });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /did not answer status within 100ms/);
+    assert.match(res.stderr, /event loop may be stalled/);
+    assert.doesNotMatch(res.stderr, /Is the server running/);
+  } finally {
+    silent.closeAllConnections?.();
+    silent.close();
   }
 });

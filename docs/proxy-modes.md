@@ -24,7 +24,9 @@ MITM mode launches claude pointed at TeamClaude as an **HTTPS forward proxy** (`
 - reads `anthropic-ratelimit-*` from responses for quota; and
 - **resends the request on a different account** if one returns a quota `429`, so a "you've reached your limit" is never surfaced while another account has headroom.
 
-Because the request is buffered, the retry is transparent to claude. Client token refreshes (`/v1/oauth/token`), Remote Control (`/v1/code/*`) and claude.ai attachment transfers (`/api/oauth/files/*`, `/api/oauth/file_upload`) are passed through with the client's own credential, since they are bound to the paired identity and would 403 under a rotated token. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
+Because the request is buffered, the retry is transparent to claude. Client token refreshes (`/v1/oauth/token`), Remote Control (`/v1/code/*`, and the bridge's `/v1/environments/*`, `/v1/sessions/*`, `/v2/session_ingress/*` and `/v2/ccr-sessions/*`, which `claude remote-control` sends through `HTTPS_PROXY` since Claude Code 2.1.287) and claude.ai attachment transfers (`/api/oauth/files/*`, `/api/oauth/file_upload`) are passed through with the client's own credential, since they are bound to the paired identity and fail under a rotated token. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
+
+A pool with Codex accounts also intercepts `chatgpt.com`. Inside that tunnel only `/backend-api/codex/*` is pooled; every other request (workspace discovery, plugins, settings) is passed through to `chatgpt.com` with the client's own login, and the Codex Responses WebSocket is refused so the CLI falls back to pooled HTTPS — see [Codex accounts](accounts.md#through-the-mitm-proxy-no-codex-config-needed). `chatgpt.com` is where ChatGPT Desktop talks to as well. On a machine running that app, set `proxy.terminalOnly` to `true` to tunnel that host untouched: the terminal Codex CLI keeps reaching the pool through its explicit `/backend-api/codex` base URL, and the desktop app keeps its own login.
 
 ### Trust model
 
@@ -55,8 +57,10 @@ screen (**Network → Upstream proxy**) — it applies to the next request, with
 restart.
 
 - Covers **all** Anthropic-bound traffic: request forwarding, OAuth login, token
-  refresh, profile and usage lookups. A proxy that covered only some of them
-  would leave you able to refresh an account but not add one, or the reverse.
+  refresh, profile and usage lookups, and (since per-account routing landed)
+  `teamclaude api`, which used to go direct. A proxy that covered only some of
+  them would leave you able to refresh an account but not add one, or the
+  reverse.
 - `HTTPS_PROXY` / `ALL_PROXY` are picked up automatically when the config sets
   nothing, so a machine already configured for other tools needs no extra setup.
   When that happens the server says so on startup, and the TUI marks the row with
@@ -64,11 +68,22 @@ restart.
   silently in force.
 - `NO_PROXY` (or `noProxy`) exempts hosts by suffix; `"upstreamProxy": false`
   ignores the environment entirely.
+- **A proxy that is this server is refused.** `teamclaude env` exports
+  `HTTPS_PROXY` pointing at TeamClaude, so a server or CLI started from that
+  shell would inherit itself as its egress proxy — every upstream call would
+  re-enter the proxy and be answered for whichever account it selected, silently
+  (a usage probe would then store that one account's quota under all of them).
+  A value whose address is our own listener is dropped, whether it came from the
+  environment or the config, and the startup line and the TUI row say so.
 - **TLS stays end-to-end.** The tunnel is a plain `CONNECT`; the proxy sees
   ciphertext only, and certificate verification is unchanged. A proxy that
   intercepts TLS needs its CA in `NODE_EXTRA_CA_CERTS`.
-- SOCKS proxies are not supported — only HTTP `CONNECT`. A `socks5://` value is
-  rejected at startup rather than failing later at connect time.
+- SOCKS URLs are refused here (`http` `CONNECT` only), as is `https://` to the
+  proxy itself: TeamClaude does not speak TLS *to* the proxy, and accepting the
+  scheme would send the `CONNECT` (credentials included) in plaintext to port
+  443. Write `http://host:port` — the tunnel through it is end-to-end TLS
+  regardless. (SOCKS **is** supported one level down, per account: see
+  [per-account routing](#per-account-routing) below.)
 
 This is a property of the **network**, not a routing policy: when set, it is
 simply how this machine reaches Anthropic. That is what separates it from sx.org
@@ -77,9 +92,55 @@ configured, a request routed via sx.org uses sx.org; everything else uses the
 upstream proxy. Neither is related to `proxy.port`, which is the local port
 Claude Code connects **to**.
 
+## Per-account routing
+
+The fleet settings above move *every* account together. `accounts[].routing`
+does the opposite: it pins **one** account to its own proxy and leaves the rest
+untouched.
+
+```bash
+teamclaude login --name "waffles@waffle.com" --routing "socks5h://alice:s3cret@proxy.example.com:1080"
+teamclaude routing waffles@waffle.com socks5h://alice:s3cret@proxy.example.com:1080
+teamclaude routing waffles@waffle.com none   # back to the fleet path
+```
+
+```json
+{ "name": "waffles@waffle.com", "type": "oauth", "routing": "socks5h://alice:s3cret@proxy.example.com:1080" }
+```
+
+- **All of that account's traffic** tunnels through it: request forwarding,
+  OAuth login and token refresh, profile, usage and quota probes. A proxy that
+  covered only some of those would strand the account mid-rotation.
+- **Only that account.** Every other account keeps the fleet path, and the
+  routed account ignores both the fleet upstream proxy and sx.org (chaining
+  would be two hops for one problem).
+- Schemes: `http` (CONNECT), `socks5`, `socks5h`, `socks4`, `socks4a`, with
+  optional `user:pass@` auth (SOCKS4 takes a username only). The `h`/`a`
+  suffixes follow curl's convention and resolve hostnames at the proxy; the
+  bare forms resolve locally. A bare `host:port` is `http`.
+- **TLS stays end-to-end** exactly as through the fleet proxy: the account's
+  proxy relays ciphertext only, and certificate verification is unchanged.
+- Changes apply live: the CLI command and disk edits both flow through the same
+  reload as every other per-account field. The URL shows password-masked in
+  `accounts`, `status`, the TUI and the dashboard.
+- A new URL is tested first: a tunnel to the account's upstream and a TLS
+  handshake, with no request sent. A proxy that does not answer is refused and
+  nothing is saved (`--no-check` skips the test).
+- A proxy that goes down later takes only its own account out. The request
+  fails over to the next account and the routed one sits out for 30 seconds
+  before its proxy is tried again. See
+  [When the proxy is down](accounts.md#when-the-proxy-is-down).
+
+Typical uses: one account that only answers from a specific region, an account
+served through a jump host the others cannot use, or one seat whose traffic
+must exit a particular network. See [accounts.md](accounts.md#per-account-routing-routing)
+for the CLI reference.
+
 ## sx.org proxy mode
 
 Off by default. Some transient `429`s key on the proxy's **outbound IP**, not the account, so rotating accounts doesn't help. To work around them, TeamClaude can route upstream requests through a residential proxy from [sx.org](https://sx.org), giving a different egress IP.
+
+No sx.org account yet? Sign up through TeamClaude's referral link, **<https://sx.org/c/ufVrLW>** — it costs you nothing extra, and the referral supports TeamClaude development.
 
 Open the TUI, press **`g`** for the settings screen, and put your sx.org API key in the **sx.org API key** row (stored in `config.sx.apiKey`). TeamClaude reuses an existing active proxy port on your sx.org account, or auto-creates a residential US one, and dials the upstream through it via HTTP `CONNECT` on **both** the reverse-proxy and MITM paths.
 

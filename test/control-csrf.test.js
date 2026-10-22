@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, isSameOriginControlRequest } from '../src/server.js';
 
@@ -78,6 +79,55 @@ test('reload is refused cross-origin as well', async () => {
   }, { reload: async () => { reloads++; return 0; } });
 });
 
+// The account controls are config writes reachable by the identical route, so
+// the guard has to cover them too — and a refusal must land before any hook,
+// not after a write that then gets reported as refused.
+test('priority and disable are refused cross-origin, before any hook runs', async () => {
+  const ran = [];
+  const hooks = {
+    setAccountPriority: async () => { ran.push('priority'); return { name: 'bob@example.com', priority: -1 }; },
+    setAccountDisabled: async () => { ran.push('disabled'); return { name: 'bob@example.com', disabled: true }; },
+    reload: async () => { ran.push('reload'); return 0; },
+  };
+  await withServer(async (_am, port) => {
+    for (const [path, body] of [
+      ['/teamclaude/priority', { account: 'bob@example.com', place: 'first' }],
+      ['/teamclaude/disable', { account: 'bob@example.com', disabled: true }],
+    ]) {
+      const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+        body: JSON.stringify(body),
+      });
+      assert.equal(res.status, 403, path);
+      assert.match((await res.json()).error, /cross-origin/);
+    }
+    assert.deepEqual(ran, [], 'a refused request must not have reached a hook');
+  }, hooks);
+});
+
+// The threshold endpoint is the one control-plane mutation that writes to the
+// config FILE, so a page reaching it would change a setting that outlives the
+// process — and a low enough number takes the whole fleet out of rotation. The
+// guard has to run before any of that: the reload hook standing in for "nothing
+// happened" is what says the request was stopped at the gate, not merely
+// answered with a 403 afterwards. (The same-origin path, which the dashboard's
+// own button uses, is covered in server-threshold.test.js against a throwaway
+// config.)
+test('the threshold cannot be set cross-origin', async () => {
+  let reloads = 0;
+  await withServer(async (_am, port) => {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/threshold`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+      body: JSON.stringify({ percent: 1 }),
+    });
+    assert.equal(res.status, 403);
+    assert.match((await res.json()).error, /cross-origin/);
+    assert.equal(reloads, 0, 'a refused threshold change must not have been applied');
+  }, { reload: async () => { reloads++; return 0; } });
+});
+
 // The guard is worthless if it also blocks the CLI. curl and teamclaude attach
 // send neither header.
 test('a request with no browser headers still works', async () => {
@@ -100,15 +150,73 @@ test('a same-origin browser request is allowed through', async () => {
   });
 });
 
-// Reading status cross-origin is already prevented by the same-origin policy —
-// the page issues the request but cannot see the answer — so the guard is
-// deliberately scoped to mutations and does not break anyone polling status.
-test('the guard applies to mutations, not to reads', async () => {
-  await withServer(async (_am, port) => {
-    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
-      headers: { Origin: 'https://evil.example' },
+// The control plane is not the only thing the loopback exemption exposes to a
+// page. The same no-cors POST reaches /v1/messages, where the proxy injects a
+// fleet credential — a quota drain, with the page's prompt content booked to
+// the operator — so a key-less loopback request is refused cross-origin on
+// EVERY path, not only under /teamclaude/.
+test('a page cannot spend fleet quota through /v1/messages cross-origin', async () => {
+  let reached = 0;
+  const upstream = http.createServer((_req, res) => {
+    reached++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(ACCTS, 0.98);
+  const proxy = createProxyServer(am, { ...CONFIG, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    for (const headers of [{ Origin: 'https://evil.example' }, { 'Sec-Fetch-Site': 'cross-site' }]) {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain', ...headers },
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+      });
+      assert.equal(res.status, 403);
+      assert.match((await res.json()).error.message, /cross-origin/);
+    }
+    assert.equal(reached, 0, 'a refused request must not have been forwarded');
+    // The same request from a non-browser client is forwarded as before.
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
     });
     assert.equal(res.status, 200);
+    assert.equal(reached, 1);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// Reads too: the same-origin policy keeps the answer from the page only for as
+// long as no CORS header ever leaks, so a key-less cross-origin GET is refused
+// rather than relied upon to be unreadable.
+test('a key-less cross-origin read of status is refused; a keyed one is served', async () => {
+  await withServer(async (_am, port) => {
+    const refused = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert.equal(refused.status, 403);
+    // A caller that presented a valid key has proven itself; the browser
+    // headers no longer matter. (The dashboard polls status this way.)
+    const keyed = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: { Origin: 'https://evil.example', 'x-api-key': 'tc-test' },
+    });
+    assert.equal(keyed.status, 200);
+  });
+});
+
+// The control-plane gate still applies to mutations even WITH a key: the
+// browser would preflight a request carrying x-api-key and never send it
+// cross-origin, so nothing legitimate is lost by keeping the stricter rule.
+test('a keyed cross-origin control-plane POST is still refused', async () => {
+  await withServer(async (am, port) => {
+    const res = await switchTo(port, 'bob@example.com', { Origin: 'https://evil.example', 'x-api-key': 'tc-test' });
+    assert.equal(res.status, 403);
+    assert.equal(am.currentIndex, 0);
   });
 });
 

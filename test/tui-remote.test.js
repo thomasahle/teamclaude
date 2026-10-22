@@ -12,7 +12,8 @@ const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 // Every action here crosses a real socket, so wait for the thing to have
 // happened rather than for a duration: a fixed sleep is a race that a loaded
 // machine loses, and these tests run alongside the rest of the suite.
-async function waitFor(predicate, what, timeoutMs = 5000) {
+// The default is a watchdog, far above what a loaded machine adds.
+async function waitFor(predicate, what, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
@@ -211,6 +212,39 @@ test('an unknown current account marks nothing current rather than guessing', as
   const { am } = await makeSession(t);
   am.applyStatus(statusFixture({ currentAccount: 'gone' }));
   assert.equal(am.currentIndex, -1);
+});
+
+// A per-account switchThreshold (#409) rides the wire as a plain field on the
+// account object — the same `...a` spread that already carries maxUsage — so
+// the attached dashboard must resolve it exactly as the live server did, not
+// just display the fleet's own number for every account.
+test('thresholdFor resolves a per-account override off the wire, agreeing with the live gate', async (t) => {
+  const { am } = await makeSession(t);
+  am.applyStatus(statusFixture({
+    switchThreshold: 0.98,
+    accounts: [
+      {
+        name: 'alpha', type: 'oauth', orgName: null, priority: 0, disabled: false,
+        status: 'active', sessions: 1, switchThreshold: 1.0,
+        quota: {}, usage: { totalRequests: 0 }, rateLimitedUntil: null, pausedUntil: null,
+      },
+      {
+        name: 'bravo', type: 'apikey', orgName: null, priority: 0, disabled: false,
+        status: 'active', sessions: 1, switchThreshold: { unified7dFable: 0.8 },
+        quota: {}, usage: { totalRequests: 0 }, rateLimitedUntil: null, pausedUntil: null,
+      },
+    ],
+  }));
+  const [alpha, bravo] = am.accounts;
+  assert.equal(am.thresholdFor('unified7d', alpha), 1.0);
+  // A table without `default` only overrides the bucket it names — the rest
+  // still reads the fleet's own setting.
+  assert.equal(am.thresholdFor('unified7dFable', bravo), 0.8);
+  assert.equal(am.thresholdFor('unified7d', bravo), 0.98);
+  // No account (or an account with no override) reads the fleet value alone —
+  // this is also what the TUI's tag-width budget calls to find the fleet side
+  // of the comparison.
+  assert.equal(am.thresholdFor('unified7d'), 0.98);
 });
 
 test('previewRouteIndex resolves a route target by glob', async (t) => {
@@ -620,4 +654,145 @@ test('attach mode does not present an activity stream it cannot see', async (t) 
   am.applyStatus(statusFixture());
   const out = renderToString(tui);
   assert.doesNotMatch(out, /Activity/);
+});
+
+// ── hostile payloads ─────────────────────────────────────────
+
+// Whatever answers on the configured port writes these strings, and the
+// dashboard draws them into the frame every second. A number where a name was
+// expected used to throw inside the renderer and end the poll loop; an escape
+// sequence in any of them reached the terminal as-is.
+const CLIP = '\x1b]52;c;aGVsbG8=\x07';
+const hostileStatus = () => statusFixture({
+  currentAccount: `alpha${CLIP}`,
+  routes: [{
+    name: 5, match: [`*fable*${CLIP}`, 7], bucket: `\x1b[2Jbkt`, color: ['red'],
+    pinned: `alpha${CLIP}`, target: { x: 1 },
+    accounts: [{ name: 9, eligible: 'yes' }, { name: `bravo\x1b[2J`, eligible: true }],
+  }],
+  accounts: [
+    { name: 5, type: { evil: true }, status: `active${CLIP}\r\nforged`, orgName: `org\x1b[2J`, quota: {} },
+    { name: `alpha${CLIP}`, type: `oauth\x9b2J`, status: 'active', unavailable: `disabled${CLIP}`, quota: {} },
+    { name: 'x'.repeat(500), type: 'oauth', status: 'active', quota: {} },
+  ],
+});
+
+test('a hostile status payload is coerced and stripped before it is drawn', async (t) => {
+  const { tui, am } = await makeSession(t);
+  am.applyStatus(hostileStatus());
+
+  // sanitizeText drops the control bytes and keeps the printable remainder, so
+  // an OSC payload survives as harmless text; what matters is that no ESC/BEL/C1
+  // does, and that a non-string became a string rather than an exception.
+  const noControls = v => assert.doesNotMatch(v, /[\x1b\x07\x9b\r\n]/);
+  assert.equal(am.accounts[0].name, '5');
+  assert.match(am.accounts[1].name, /^alpha/);
+  assert.equal(am.accounts[2].name, 'x'.repeat(64));
+  assert.equal(am.accounts[0].type, '?');           // an object is not a type
+  assert.match(am.accounts[0].status, /^active /);   // stripped, then capped at 16
+  assert.match(am.accounts[1].type, /^oauth/);
+  assert.equal(am.currentIndex, 1);                 // the stripped current name still matches
+  assert.equal(am.routes[0].name, '5');
+  assert.equal(am.routes[0].match[1], '7');
+  assert.deepEqual(am.routes[0].accounts.map(a => a.eligible), [true, true]);
+  assert.equal(am.routes[0].accounts[0].name, '9');
+  for (const a of am.accounts) for (const k of ['name', 'type', 'status', 'orgName', 'unavailable']) if (a[k]) noControls(a[k]);
+  for (const r of am.routes) {
+    for (const k of ['name', 'bucket', 'color', 'pinned', 'target']) if (r[k]) noControls(r[k]);
+    r.match.forEach(noControls);
+    r.accounts.forEach(a => noControls(a.name));
+  }
+
+  const chunks = [];
+  const orig = process.stdout.write;
+  process.stdout.write = chunk => { chunks.push(chunk); return true; };
+  try { tui.running = true; tui._render(true); } finally { process.stdout.write = orig; }
+  // Only the frame's own escapes may remain: cursor home, SGR colour, cursor toggle.
+  const foreign = chunks.join('').replace(/\x1b\[[0-9;]*m/g, '').replace(/\x1b\[H|\x1b\[\?25[hl]/g, '');
+  assert.doesNotMatch(foreign, /[\x1b\x07\x9b]/);
+});
+
+test('a poll that delivers a hostile payload keeps polling', async (t) => {
+  const { session, am, tui } = await makeSession(t, {
+    routes: { 'GET /teamclaude/status': json(hostileStatus()) },
+  });
+  await session.poll();
+  assert.equal(am.connected, true);
+  assert.equal(tui.log.length, 0);   // no "lost contact": the payload was rendered, not thrown on
+});
+
+test('the name a switch reply echoes is stripped before it is logged', async (t) => {
+  const { tui, am } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      'POST /teamclaude/switch': json({ ok: true, account: `alpha${CLIP}\x1b[2J` }),
+    },
+  });
+  am.applyStatus(statusFixture());
+  tui._key('s');
+  tui._key('enter');
+  await logged(tui);
+  assert.doesNotMatch(tui.log[0].msg, /[\x1b\x07]/);
+  assert.match(tui.log[0].msg, /Switched to "alpha/);
+});
+
+test('an error reason off the wire is stripped and clamped', async (t) => {
+  const { control } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      'POST /teamclaude/reload': json({ ok: false, error: `nope${CLIP}\x1b[2J${'y'.repeat(500)}` }),
+      'POST /teamclaude/switch': (req, res) => {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `no such account${CLIP}` }));
+      },
+    },
+  });
+  await assert.rejects(() => control.reload(), err => {
+    assert.doesNotMatch(err.message, /[\x1b\x07]/);
+    assert.ok(err.message.length <= 200);
+    return /^nope/.test(err.message);
+  });
+  await assert.rejects(() => control.switchAccount('ghost'), err => {
+    assert.equal(err.answered, true);
+    assert.doesNotMatch(err.message, /[\x1b\x07]/);
+    return /^no such account/.test(err.message);
+  });
+});
+
+// ── reply size ───────────────────────────────────────────────
+
+// The poller runs every second against whatever listens on the configured
+// port. A status payload is a few KiB; a body that is not must not be buffered
+// whole, whether it announces its size or streams it.
+test('a reply that declares itself oversized is refused before it is read', async (t) => {
+  const { control } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': String(2 * 1024 * 1024) });
+        res.write('{"accounts":[');   // never finishes; the client must not wait for it
+      },
+    },
+  });
+  await assert.rejects(() => control.status(), /too large/);
+});
+
+test('a chunked reply is abandoned once it passes the cap', async (t) => {
+  const { control } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });   // chunked: no length
+        const chunk = 'x'.repeat(64 * 1024);
+        for (let i = 0; i < 24; i++) res.write(chunk);   // 1.5 MiB
+        res.end(']');
+      },
+    },
+  });
+  await assert.rejects(() => control.status(), /too large/);
+});
+
+test('a reply under the cap is read whole', async (t) => {
+  const big = statusFixture({ note: 'y'.repeat(200 * 1024) });
+  const { control } = await makeSession(t, { routes: { 'GET /teamclaude/status': json(big) } });
+  const status = await control.status();
+  assert.equal(status.note.length, 200 * 1024);
 });

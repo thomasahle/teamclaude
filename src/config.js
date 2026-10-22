@@ -1,13 +1,22 @@
-import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
+import { readFile, open, mkdir, chmod, rename, unlink, realpath } from 'node:fs/promises';
+import { openSync, writeSync, closeSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
+import { ensureAccountIds } from './account-id.js';
+import { envVar, NAME, LEGACY_NAME } from './brand.js';
 
 export function getConfigPath() {
-  if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
+  const fromEnv = envVar('CONFIG');
+  if (fromEnv) return fromEnv;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  return join(configDir, 'teamclaude.json');
+  // The renamed file is used when it exists; until then, and for a fresh
+  // install, the file keeps its current name (issue #72, phase 1). The state
+  // file, crash log and certificates sit beside whichever one this returns.
+  const renamed = join(configDir, `${NAME}.json`);
+  if (existsSync(renamed)) return renamed;
+  return join(configDir, `${LEGACY_NAME}.json`);
 }
 
 /**
@@ -19,6 +28,16 @@ export function getConfigPath() {
 export function getStatePath() {
   const cfg = getConfigPath();
   return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.state.json') : cfg + '.state';
+}
+
+/**
+ * Path to the burn log (a sibling of the config): the quota readings behind
+ * the burn-per-hour figures (burn.js), one JSON line per sample, appended as
+ * they land and compacted on load.
+ */
+export function getBurnLogPath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.burn.jsonl') : cfg + '.burn.jsonl';
 }
 
 /**
@@ -40,12 +59,50 @@ export async function loadState() {
 }
 
 export async function saveState(state) {
-  const path = getStatePath();
+  await writeJsonAtomic(getStatePath(), state);
+}
+
+/**
+ * Write a JSON document so that the file at `path` is, at every instant, either
+ * the previous complete document or the new one.
+ *
+ * A plain writeFile truncates first and fills in afterwards. The config holds
+ * every account's OAuth tokens and the proxy key; a crash or power loss in that
+ * gap left an empty or half-written file, and the next start threw on
+ * JSON.parse with the credentials gone. So the document goes to a sibling
+ * temp file, is fsynced so it is on disk before it is named, and is renamed
+ * over the target — rename replaces atomically on POSIX and, in Node, on
+ * Windows too (same scheme mitm.js uses for the leaf key).
+ *
+ * The temp file is created 0600 and chmod'ed before the rename, so the
+ * "enforce 0600 on every save" behaviour of the old code holds: a config that
+ * was once world-readable becomes 0600 on the next save, and the tokens are
+ * never on disk under a looser mode even for an instant.
+ */
+export async function writeJsonAtomic(path, value) {
+  // A rename replaces the NAME, so a config that is a symlink (a dotfiles
+  // checkout, say) would silently become a regular file where the old in-place
+  // write followed the link. Resolve it first; a dangling or absent path is
+  // written where it is.
+  path = await realpath(path).catch(() => path);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
-  // `mode` only applies when the file is CREATED; enforce 0600 on every save so
-  // a pre-existing state file (holding quota + tokens) can't linger world-readable.
-  await chmod(path, 0o600).catch(() => {});
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+  try {
+    const fh = await open(tmp, 'w', 0o600);
+    try {
+      await fh.writeFile(JSON.stringify(value, null, 2) + '\n');
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    // `open`'s mode is masked by the umask; make the mode exact regardless.
+    await chmod(tmp, 0o600).catch(() => {});
+    await rename(tmp, path);
+  } catch (err) {
+    // Never leave a half-written copy of the credentials lying beside the config.
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
 }
 
 export function createDefaultConfig() {
@@ -58,8 +115,18 @@ export function createDefaultConfig() {
     switchThreshold: 0.98,
     holdSeconds: 0,
     distributeSessions: false,
+    sessionTitles: { enabled: false, width: 18 },
+    quotaBarPercent: false,
+    accountSort: 'arranged',
     eventLogging: 'hide',
+    defaultClientMode: 'mitm',
+    // Written out rather than left absent, so a fresh config states the one
+    // setting whose default matters most: a redemption cannot be undone and the
+    // credits are scarce, so nothing spends one until this is switched on.
+    autoRedeemResets: false,
     blockedModels: [],
+    stripOverageHeaders: false,
+    synthesizeQuotaHeaders: false,
     accounts: [],
   };
 }
@@ -68,6 +135,16 @@ export async function loadConfig() {
   const path = getConfigPath();
   try {
     const config = JSON.parse(await readFile(path, 'utf-8'));
+    // A file with no `accounts` key is what an empty or hand-trimmed config
+    // looks like. Every reader treats the list as always present, and the first
+    // one to trip was the save path — so the failure arrived while writing,
+    // long after the read that could have explained it (#330). A missing list
+    // is an empty one.
+    if (!Array.isArray(config.accounts)) config.accounts = [];
+    // Everything downstream pairs config entries to running accounts by entry id,
+    // so a config written before the field existed — or edited by hand — is given
+    // ids here, before anything can read one. The next save persists them.
+    ensureAccountIds(config.accounts);
     applyUpstreamProxy(config);
     return config;
   } catch (err) {
@@ -104,43 +181,136 @@ export async function loadOrCreateConfig() {
     config = createDefaultConfig();
     await saveConfig(config);
     console.log(`Created config at ${getConfigPath()}`);
+    // loadConfig applies this only when a file already existed — it returns
+    // early on ENOENT. Without it here, the FIRST run of a network command
+    // (`login` on a fresh install) leaves the process-wide setting unset, and
+    // the lazy fallback resolves it from the environment against an EMPTY
+    // config. That fallback has no listener to compare against, so the
+    // self-proxy guard cannot fire: an operator whose HTTPS_PROXY points at
+    // their own TeamClaude gets a CONNECT back into the proxy and a timeout,
+    // on the one run where there is no config to explain it.
+    applyUpstreamProxy(config);
   }
   return config;
 }
 
-export async function saveConfig(config) {
-  const path = getConfigPath();
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
-  // Enforce 0600 even if the file already existed (the proxy apiKey + account
-  // tokens live here); `mode` above is honored only on creation.
-  await chmod(path, 0o600).catch(() => {});
+// Every writer of the config — the server rotating a refresh token, a CLI
+// command, a GUI client — does its own read-modify-write with a temp+rename.
+// Two of them racing keep only the later write, and the edit that is lost is
+// as likely as not a freshly rotated refresh token, which costs a re-login.
+// The lock below is the coordination point. It is advisory and file-based so
+// that clients outside this package can honour it with no shared code:
+//
+//   path     <configPath>.lock
+//   acquire  open(O_CREAT|O_EXCL, 0600), then write {"pid":<pid>,"at":<ms epoch>}
+//   stale    `at` older than 10 s, or the pid no longer alive: unlink and retry
+//   busy     poll every 25 ms for at most 2 s, then write WITHOUT the lock
+//   release  unlink
+//
+// The 2 s cap is deliberate: a writer must never hang on a lock, so contention
+// past it degrades to today's behaviour (a possible lost update) plus one
+// warning line, rather than to a stuck server or CLI.
+const LOCK_STALE_MS = 10_000;
+const LOCK_WAIT_MS = 2_000;
+const LOCK_POLL_MS = 25;
+
+/** The wait budget, read per acquisition: TEAMCLAUDE_CONFIG_LOCK_WAIT_MS
+ * overrides the 2 s for a deployment whose writers are known to hold the
+ * lock longer (and lets a test pick a budget its assertions do not race). */
+function lockWaitMs() {
+  const env = Number(envVar('CONFIG_LOCK_WAIT_MS'));
+  return env > 0 ? env : LOCK_WAIT_MS;
 }
 
-// Serialize config updates. atomicConfigUpdate is a read-modify-write, so two
-// concurrent callers can both read the same config and then save in turn, and
-// the later save silently drops the earlier caller's change. This bites hardest
-// on startup, when several OAuth accounts refresh their tokens at once: only the
-// last writer's rotated refresh token persists, and the other accounts keep a
-// token that was just rotated away, so they fail on the next restart with
-// invalid_grant and need a re-login. Chaining the updates keeps every write.
-let configUpdateChain = Promise.resolve();
+function lockIsStale(lockPath) {
+  let pid, at;
+  try {
+    ({ pid, at } = JSON.parse(readFileSync(lockPath, 'utf8')));
+  } catch (err) {
+    if (err.code === 'ENOENT') return false; // released under us; the retry takes it
+    // Empty or garbled: the holder is between its open and its write, or died
+    // there. Only the file's age can tell those apart.
+    try { return Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { return false; }
+  }
+  if (Date.now() - at > LOCK_STALE_MS) return true;
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return false; } catch (err) { return err.code === 'ESRCH'; }
+}
+
+/** True when the lock is ours; false when we gave up and proceed without it. */
+async function acquireConfigLock(lockPath) {
+  const waitMs = lockWaitMs();
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, 'wx', 0o600);
+      try { writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() })); } finally { closeSync(fd); }
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        console.error(`[TeamClaude] Cannot create ${lockPath} (${err.code || err.message}); writing the config without it`);
+        return false;
+      }
+    }
+    if (lockIsStale(lockPath)) {
+      await unlink(lockPath).catch(() => {});
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
+      return false;
+    }
+    await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
+  }
+}
+
+// One queue per lock path inside this process: same-process callers (the TUI
+// saving while a token refresh runs) would otherwise spin against their own
+// live lock file for the full 2 s.
+const lockQueues = new Map();
+
+/**
+ * Run `fn` while holding the advisory lock for `configPath` (protocol above).
+ * Same-process callers are queued; other processes are held off by the file.
+ * The lock is released whether `fn` resolves or throws.
+ */
+export function withConfigLock(configPath, fn) {
+  const lockPath = `${configPath}.lock`;
+  const run = async () => {
+    await mkdir(dirname(lockPath), { recursive: true });
+    const held = await acquireConfigLock(lockPath);
+    try {
+      return await fn();
+    } finally {
+      if (held) await unlink(lockPath).catch(() => {});
+    }
+  };
+  const prev = lockQueues.get(lockPath) || Promise.resolve();
+  const result = prev.then(run, run);
+  lockQueues.set(lockPath, result.then(() => {}, () => {}));
+  return result;
+}
+
+export async function saveConfig(config) {
+  const path = getConfigPath();
+  // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
+  // for why this is not a plain writeFile.
+  await withConfigLock(path, () => writeJsonAtomic(path, config));
+}
 
 /**
  * Atomically update the config: re-reads from disk, calls updater(config),
  * then saves. Returns the updated config. This prevents overwriting changes
  * made by other processes (e.g. `teamclaude import` while the server runs), and
- * serializes concurrent callers so simultaneous updates queue instead of
- * clobbering one another.
+ * holds the config lock across the read and the write so a concurrent writer —
+ * in this process or another — waits its turn instead of clobbering the update.
  */
 export function atomicConfigUpdate(updater) {
-  const run = async () => {
+  const path = getConfigPath();
+  return withConfigLock(path, async () => {
     const config = await loadConfig() || createDefaultConfig();
     await updater(config);
-    await saveConfig(config);
+    await writeJsonAtomic(path, config);
     return config;
-  };
-  const result = configUpdateChain.then(run, run);
-  configUpdateChain = result.then(() => {}, () => {});
-  return result;
+  });
 }

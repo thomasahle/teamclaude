@@ -90,6 +90,9 @@ test('long upstream Retry-After is surfaced without sleeping in client request',
   const proxyPort = await listen(proxy);
 
   try {
+    // The bound is the 300 s retry window the proxy must NOT sleep through,
+    // not a measure of speed: a signal at a fraction of that window fails a
+    // proxy that absorbed it and nothing that merely ran on a busy machine.
     const started = Date.now();
     let res;
     try {
@@ -97,16 +100,16 @@ test('long upstream Retry-After is surfaced without sleeping in client request',
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model: 'x', messages: [] }),
-        signal: AbortSignal.timeout(2000),
+        signal: AbortSignal.timeout(60_000),
       });
     } catch (err) {
-      assert.fail(`request should return 429 promptly, got ${err.name}`);
+      assert.fail(`request should return 429 without waiting out the retry window, got ${err.name}`);
     }
 
     await res.text();
     assert.equal(res.status, 429);
     assert.equal(upstreamHits, 1, 'long Retry-After should not be retried inline');
-    assert.ok(Date.now() - started < 2000, 'request should not sleep for upstream retry window');
+    assert.ok(Date.now() - started < 150_000, 'request should not sleep for upstream retry window');
     assert.equal(am.accounts[0].status, 'active', 'rate-limit 429 must not throttle/rotate the account');
     assert.ok(am.accounts[0].pausedUntil > Date.now(), 'account should be paused so concurrent requests wait');
   } finally {
@@ -118,7 +121,7 @@ test('long upstream Retry-After is surfaced without sleeping in client request',
 // A rate-limit 429 (no quota-rejected status) must NOT rotate to another
 // account — every retry stays on the same one (#84: rotating just moves the
 // burst and drops the KV cache).
-test('a rate-limit 429 never rotates to another account', async () => {
+test('a rate-limit 429 rotates at most once, never into a carousel', async () => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     seen.push(req.headers.authorization);
@@ -141,11 +144,26 @@ test('a rate-limit 429 never rotates to another account', async () => {
     });
     await res.text();
     assert.equal(res.status, 429);
+    // The invariant changed deliberately. #84 argued that rotating on a
+    // rate-limit 429 moves the burst and discards the KV cache, and this test
+    // used to assert no rotation at all. That was too strong: it also stalled a
+    // fleet whose sibling was idle, which is what #137, #165 and #156 reported.
+    //
+    // What has to hold now is the bounded version — ONE hop, not a walk of the
+    // fleet. When the second account is throttled too the limit is scoped to
+    // the egress IP, not the accounts, so continuing would pay a cold cache per
+    // attempt to learn nothing.
+    // One hop means two DISTINCT accounts. The attempt count is higher than two
+    // on purpose: this upstream answers `retry-after: 1`, inside the inline
+    // absorb cap, so after the hop the same-account wait-and-retry still runs —
+    // pre-existing behaviour that the hop does not replace. What must not happen
+    // is a third account being drawn in.
     const accounts = new Set(seen);
-    assert.equal(accounts.size, 1, `all hits should be on one account, saw ${[...accounts]}`);
-    assert.equal(am.accounts[0].status, 'active', 'current account not throttled');
+    assert.equal(accounts.size, 2, `expected one hop, saw ${accounts.size} accounts`);
+    // Still no throttling: a rate-limit 429 is not quota exhaustion, so neither
+    // account is marked, and both stay selectable once their pause lapses.
+    assert.equal(am.accounts[0].status, 'active', 'a rate limit must not throttle the account');
     assert.equal(am.accounts[1].status, 'active');
-    assert.equal(am.accounts[1].pausedUntil, null, 'the other account is untouched — no rotation');
   } finally {
     proxy.close();
     upstream.close();
