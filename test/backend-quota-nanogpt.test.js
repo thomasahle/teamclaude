@@ -36,6 +36,13 @@ test('both windows land in one reading, the bar the fuller of the two', async ()
   assert.equal(r.label, 'Plan');
   assert.equal(r.text, 'day 12% (resets 5h10m) · week 37% (resets 3d4h)');
   assert.equal(r.utilization, 0.37);
+  // The weekly window also fills the slot the TUI row draws its Wk bar from.
+  assert.deepEqual(r.windows, { weekly: { utilization: 0.37, resetAt: ACTIVE.weeklyInputTokens.resetAt } });
+});
+
+test('a plan with no weekly window, or a trial, fills no bar slot', async () => {
+  assert.deepEqual((await read({ ...ACTIVE, weeklyInputTokens: null })).windows, {});
+  assert.deepEqual((await read({ active: true, state: 'active', tokens: win(0.2, 2 * H) })).windows, {});
 });
 
 test('a subscription that has run out says it is now billing the balance', async () => {

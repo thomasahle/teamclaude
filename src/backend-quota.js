@@ -314,10 +314,20 @@ const PROVIDERS = [
       if (mode === 'paygo') parts.push(body.routing?.paidSpendPolicyAllowsBalance === false ? 'balance not allowed' : 'billing balance');
       else if (mode === 'unavailable') parts.push('unavailable');
       if (body.state === 'grace') parts.push('grace period');
+      // The weekly window also goes in the structured slot the account row
+      // draws its Wk bar from. Without it the row had nothing to draw and read
+      // `Wk -` beside a reading that held the number. The daily window has no
+      // slot of its length, and a trial's has no stated length, so both stay
+      // in the text only.
+      /** @type {BackendQuotaWindows} */
+      const structured = {};
+      const week = windows.find(w => w.name === 'week');
+      if (week) structured.weekly = { utilization: week.used, resetAt: week.resetAt };
       return {
         label: 'Plan',
         text: parts.join(' · '),
         utilization: Math.min(1, Math.max(...windows.map(w => w.used))),
+        windows: structured,
       };
     },
   },
