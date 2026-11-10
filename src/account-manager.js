@@ -151,6 +151,10 @@ export const FABLE_FOCUS_MIN_LEFT_MS = 24 * 60 * 60 * 1000;
 export const FABLE_FOCUS_DECLINED_HOLD_MS = 6 * 60 * 60 * 1000;
 // The model the focus asks availability for when no request names one.
 const FABLE_FOCUS_SAMPLE = 'claude-fable-5';
+// The part of the shared weekly Fable may use: the usage payload's
+// `weekly_scoped_shares[].allowance_percent_of_weekly`, 50 on every Max and
+// Team account read on 2026-11-10.
+const FABLE_SHARE_OF_WEEKLY = 0.5;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -3594,8 +3598,9 @@ export class AccountManager {
    *    its Fable resets to be spent (onFableFocusSpent) when it holds one and at
    *    least FABLE_FOCUS_MIN_LEFT_MS of the Fable week is left; Fable spills to
    *    the ordinary walk until the reset lands;
-   *  - otherwise the focus moves on (_fableFocusAccount): to the account that
-   *    can serve Fable holding the most Fable resets it has time to use, then
+   *  - otherwise the focus moves on (_fableFocusAccount): to an account that
+   *    can serve Fable, first one whose shared weekly has room for the rest of
+   *    its Fable allowance, then the most Fable resets it has time to use, then
    *    the emptiest shared weekly.
    *
    * Applied live on config reload.
@@ -3637,18 +3642,30 @@ export class AccountManager {
     return left != null && left >= FABLE_FOCUS_MIN_LEFT_MS ? heldFableResets(account.quota, now) : 0;
   }
 
+  /** Where rotation stops using `bucket` on `account`: the lower of the switch threshold and its cap. */
+  _fableFocusLimit(/** @type {Record<string, any>} */ account, /** @type {string} */ bucket) {
+    return Math.min(this.thresholdFor(bucket, account), resolveMaxUsage(account.maxUsage, bucket) ?? 1);
+  }
+
+  /** Whether `account`'s shared weekly has room for the rest of its Fable
+   * allowance. Without it the weekly stops Fable first, and a reset spent later
+   * gives back only what Fable reached by then. */
+  _fableFocusCanFill(/** @type {Record<string, any>} */ account) {
+    const q = account.quota;
+    const weeklyRoom = this._fableFocusLimit(account, 'unified7d') - (q.unified7d ?? 0);
+    const fableRoom = this._fableFocusLimit(account, 'unified7dFable') - (q.unified7dFable ?? 0);
+    return weeklyRoom >= fableRoom * FABLE_SHARE_OF_WEEKLY;
+  }
+
   /** Whether `account`'s own Fable weekly is spent and a Fable reset it holds
    * would put it back: the case where the focus waits for a reset rather than
-   * moving on. Its threshold is the lower of the switch threshold and its cap,
-   * the ceiling rotation itself stops at. */
+   * moving on. */
   _fableFocusRestorable(/** @type {Record<string, any>} */ account, now = Date.now()) {
     if (!this._fableFocusCandidate(account) || account.status === 'error' || account.autoRedeemReset === false) return false;
     if (account._fableFocusHoldUntil && now < account._fableFocusHoldUntil) return false;
     if (this._fableFocusResets(account, now) < 1) return false;
     const used = account.quota.unified7dFable;
-    const cap = resolveMaxUsage(account.maxUsage, 'unified7dFable');
-    const limit = Math.min(this.thresholdFor('unified7dFable', account), cap ?? 1);
-    return used != null && used >= limit;
+    return used != null && used >= this._fableFocusLimit(account, 'unified7dFable');
   }
 
   /**
@@ -3663,7 +3680,8 @@ export class AccountManager {
       && (this._isAvailable(held, FABLE_FOCUS_SAMPLE) || this._fableFocusRestorable(held, now))) return held;
     const next = this.accounts
       .filter(a => this._fableFocusCandidate(a) && this._isAvailable(a, FABLE_FOCUS_SAMPLE))
-      .sort((a, b) => this._fableFocusResets(b, now) - this._fableFocusResets(a, now)
+      .sort((a, b) => Number(this._fableFocusCanFill(b)) - Number(this._fableFocusCanFill(a))
+        || this._fableFocusResets(b, now) - this._fableFocusResets(a, now)
         || (a.quota.unified7d ?? 0) - (b.quota.unified7d ?? 0)
         || a.index - b.index)[0] || null;
     if ((next?.name ?? null) !== (this._fableFocusName ?? null)) {

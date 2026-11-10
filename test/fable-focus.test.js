@@ -56,6 +56,13 @@ test('the emptiest shared weekly breaks a tie on resets', () => {
   assert.equal(pick(am, FABLE), 'acct1');
 });
 
+test('an account whose weekly cannot hold the rest of its Fable allowance ranks last', () => {
+  // 90% of the week gone: Fable would stop at the weekly long before its own
+  // half was used, and a reset there would give back only what it reached.
+  const am = fleet([{ resets: 3, weekly: 0.9, fable: 0 }, { resets: 1, weekly: 0.2, fable: 0.2 }]);
+  assert.equal(pick(am, FABLE), 'acct1');
+});
+
 test('a reset with too little of the week left to use counts for nothing', () => {
   const am = fleet([{ resets: 3, left: FABLE_FOCUS_MIN_LEFT_MS - H }, { resets: 1 }]);
   assert.equal(pick(am, FABLE), 'acct1');

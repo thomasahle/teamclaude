@@ -586,10 +586,11 @@ that:
   left to use what it gives back. Fable goes to the ordinary rotation until the
   reset lands.
 - **The focus moves on** when it can no longer serve Fable and no Fable reset
-  would put it back, or when a reset was declined. It moves to the account that
-  can serve Fable holding the most Fable resets it has time to use, then the
-  one with the emptiest shared weekly. Otherwise it stays put, so a better
-  account appearing later does not take Fable mid-week.
+  would put it back, or when a reset was declined. It moves to an account that
+  can serve Fable, preferring first one whose shared weekly has room for the
+  rest of its Fable allowance, then the most Fable resets it has time to use,
+  then the emptiest shared weekly. Otherwise it stays put, so a better account
+  appearing later does not take Fable mid-week.
 
 `accounts[].autoRedeemReset: false` exempts an account from the spending. The
 switch is independent of `autoRedeemResets`, which spends a reset only when a
