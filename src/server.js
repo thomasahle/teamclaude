@@ -1736,7 +1736,11 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
 // Artifacts (deploy, read, list, comments) are served under /api/frame/*, owned
 // by the client's user like the identity plane above; a rotated account's token
-// sees them as not found.
+// sees them as not found. Claude Code 2.1.3xx publishes them through an MCP
+// server at /api/artifacts/mcp (uploads below /api/artifacts/mcp/upload/), the
+// same plane: under a rotated token each artifact belonged to whichever account
+// rotation had picked, and its link answered "Page not found" in a browser
+// signed in as the client's user.
 //
 // The claude.ai connector list (/v1/mcp_servers) is the same plane. Claude Code
 // calls each listed connector on mcp-proxy.anthropic.com, a host this proxy
@@ -1773,7 +1777,7 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
 // Bootstrap, policy, feature flags and registry access belong to the client
 // login. Inference-only upstreams do not implement these endpoints.
 const CLIENT_CREDENTIAL_PATHS = [
-  '/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/',
+  '/v1/code/', '/api/oauth/', '/api/frame/', '/api/artifacts/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/',
   '/api/claude_cli/', '/api/claude_code/policy_limits/', '/api/claude_code_grove/', '/api/claude_code_penguin_mode/',
   '/api/eval/', '/api/eval-authed/', '/mcp-registry/v0/servers/',
 ];

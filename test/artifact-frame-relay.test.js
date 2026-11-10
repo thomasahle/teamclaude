@@ -74,3 +74,21 @@ for (const path of ['/api/frame/deploy/prepare', '/api/frame/deploy/direct']) {
     assert.equal(seen[0].body, body, 'the deploy body must reach upstream unchanged');
   });
 }
+
+// Claude Code 2.1.3xx creates artifacts through an MCP server at
+// /api/artifacts/mcp; under a rotated token they were published as a stranger.
+for (const path of ['/api/artifacts/mcp', '/api/artifacts/mcp/upload/abc123']) {
+  test(`a POST to ${path} keeps the client's own credential and its body`, async () => {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'publish' } });
+    const { status, seen } = await through(path, {
+      method: 'POST',
+      headers: { authorization: 'Bearer client-own-token', 'content-type': 'application/json' },
+      body,
+    });
+    assert.equal(status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].authorization, 'Bearer client-own-token');
+    assert.equal(seen[0].url, path);
+    assert.equal(seen[0].body, body);
+  });
+}
