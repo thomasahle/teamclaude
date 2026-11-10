@@ -407,7 +407,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, fableFocus: config.fableFocus, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -647,6 +647,10 @@ async function serverCommand() {
     accountManager.setExpiryRouting(config.expiryRouting);
     config.preferSoonestWeeklyReset = diskConfig.preferSoonestWeeklyReset;
     accountManager.setPreferSoonestWeeklyReset(config.preferSoonestWeeklyReset);
+    // Fable focus: the manager reads its own flag per selection, the redeemer
+    // reads the shared config per spend, so both are assigned.
+    config.fableFocus = diskConfig.fableFocus;
+    accountManager.setFableFocus(config.fableFocus);
     // And the advisor mode: read off the manager on every selection, so the
     // setter is the whole application. Absent on disk means 'strict' again.
     config.advisorEligibility = diskConfig.advisorEligibility;
@@ -914,6 +918,9 @@ async function serverCommand() {
   // Banked Claude usage-limit resets, armed by the same switch (autoRedeemResets).
   const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
   hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts) => claudeRedeemer.maybeRedeemForPool(accounts);
+  // Fable focus (`fableFocus`): spend a Fable reset on the account Fable is
+  // concentrated on once its Fable weekly is spent.
+  accountManager.onFableFocusSpent(account => claudeRedeemer.redeemFableForFocus(account));
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's

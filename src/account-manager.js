@@ -20,6 +20,7 @@ import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
 import { accountCredit, emptyCreditState, recordCreditUsage, rollCreditCycle, creditView, exportCreditState, restoreCreditState } from './api-credit.js';
+import { heldFableResets } from './held-resets.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
@@ -139,6 +140,17 @@ function resetTimestamp(value) {
 // Fallback when a per-bucket threshold table names neither the bucket nor a
 // `default` — the same value the single-number form has always used.
 export const DEFAULT_SWITCH_THRESHOLD = 0.98;
+
+// Fable focus (setFableFocus). A Fable reset is spent only with at least this
+// much of the Fable week left to use what it gives back; with less, the week
+// would end before the reset was worth its grant, and the focus moves on.
+export const FABLE_FOCUS_MIN_LEFT_MS = 24 * 60 * 60 * 1000;
+// How long the focus stops waiting on a reset the redeemer declined to spend
+// (its next grant was not a Fable reset, a cooldown, an unread answer), so
+// Fable moves to the next account instead of spilling while it waits.
+export const FABLE_FOCUS_DECLINED_HOLD_MS = 6 * 60 * 60 * 1000;
+// The model the focus asks availability for when no request names one.
+const FABLE_FOCUS_SAMPLE = 'claude-fable-5';
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -676,10 +688,11 @@ export class AccountManager {
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
    * @param {boolean} [opts.preferSoonestWeeklyReset]  earliest-deadline-first rotation (see setPreferSoonestWeeklyReset)
+   * @param {boolean} [opts.fableFocus]  concentrate Fable on one account at a time (see setFableFocus)
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferSoonestWeeklyReset = false, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferSoonestWeeklyReset = false, fableFocus = false, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -780,6 +793,7 @@ export class AccountManager {
     this._obsGen = 0;
     this.setExpiryRouting(expiryRouting);
     this.setPreferSoonestWeeklyReset(preferSoonestWeeklyReset);
+    this.setFableFocus(fableFocus);
     // The rollover mechanism's whole state for the sticky current account: one
     // observation, { idx, windows: name → reset }, of the account traffic was
     // resting on when a request last arrived to find it there. Null while the
@@ -1967,6 +1981,11 @@ export class AccountManager {
       const kept = this._keepOnCordoned(sessionId, exclude, model, advisorModel);
       if (kept) return kept;
     }
+    // Fable focus (setFableFocus): a Fable request may find the focus account
+    // spent and ask for one of its Fable resets; every other request first walks
+    // with the focus account set aside (`avoid`), then as before.
+    if (this.fableFocus && (this._isFableModel(model) || this._isFableModel(advisorModel))) this._fableFocusAskReset();
+    const avoid = this._fableFocusAvoid(exclude, model, advisorModel);
     // Session-affinity distribution (opt-in): keep a conversation on its pinned
     // account for cache reuse, and route a new one to the least-loaded account.
     // The unit is the conversation rather than the client session because one
@@ -1978,7 +1997,8 @@ export class AccountManager {
     // nothing eligible is found (e.g. the whole tier is exhausted).
     if (sessionId && !this._pinnedAccountForModel(model, advisorModel)) {
       if (this.distributeSessions) {
-        const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
+        const acc = (avoid && this._selectForSession(sessionId, avoid, model, advisorModel))
+          || this._selectForSession(sessionId, exclude, model, advisorModel);
         if (acc) return acc;
       } else if (this._isDrainingSession(sessionId)) {
         // Distribution was just turned off. Sessions that already existed keep
@@ -1991,8 +2011,15 @@ export class AccountManager {
     // An untagged request has no session to pin, so the walk below rests every
     // one of them on the current account. Spread them too, on their own cursor.
     if (!sessionId && this.distributeSessions && !this._pinnedAccountForModel(model, advisorModel)) {
-      const acc = this._selectUntagged(exclude, model, advisorModel);
+      const acc = (avoid && this._selectUntagged(avoid, model, advisorModel))
+        || this._selectUntagged(exclude, model, advisorModel);
       if (acc) return acc;
+    }
+    if (avoid) {
+      // No probe from this pass: an account to set the focus aside for has to
+      // be one that can serve now, or the request may as well go to the focus.
+      const off = (advisorModel && this._select(avoid, model, advisorModel, false)) || this._select(avoid, model, null, false);
+      if (off) return off;
     }
     if (advisorModel) {
       const account = this._select(exclude, model, advisorModel, false);
@@ -3552,6 +3579,127 @@ export class AccountManager {
   }
 
   /**
+   * Fable focus (`fableFocus`): concentrate Fable on one account at a time, so
+   * its Fable resets are spent where they give back the most. Fable may use up
+   * to half of an account's shared weekly, and a Fable reset gives back only
+   * what Fable used of it: on an account at 80% Opus and 20% Fable it leaves
+   * the weekly at 80%. A reset is worth the most on an account whose Fable
+   * weekly is full and whose weekly holds little else. With the switch on:
+   *
+   *  - every Fable request goes to the focus account while it can serve Fable,
+   *    as a manual route pin would send it (a manual pin still wins);
+   *  - every other request avoids the focus account while another account can
+   *    serve it, so its weekly is left to Fable;
+   *  - once its Fable weekly is spent, the next Fable request asks for one of
+   *    its Fable resets to be spent (onFableFocusSpent) when it holds one and at
+   *    least FABLE_FOCUS_MIN_LEFT_MS of the Fable week is left; Fable spills to
+   *    the ordinary walk until the reset lands;
+   *  - otherwise the focus moves on (_fableFocusAccount): to the account that
+   *    can serve Fable holding the most Fable resets it has time to use, then
+   *    the emptiest shared weekly.
+   *
+   * Applied live on config reload.
+   * @param {boolean} enabled
+   */
+  setFableFocus(enabled) {
+    this.fableFocus = enabled === true;
+    if (!this.fableFocus) this._fableFocusName = null;
+  }
+
+  /** Set the callback asked to spend a Fable reset on the focus account. It
+   * answers with the redeemer's result; anything but `redeemed: true` holds the
+   * account's reset path off for FABLE_FOCUS_DECLINED_HOLD_MS. */
+  onFableFocusSpent(/** @type {(account: Record<string, any>) => Promise<{ redeemed: boolean }>} */ callback) {
+    this._onFableFocusSpent = callback;
+  }
+
+  /** Whether `model` is governed by the Fable weekly (a route's `bucket` override included). */
+  _isFableModel(/** @type {string|null|undefined} */ model) {
+    return !!model && this._weeklyBucketFor(model) === 'unified7dFable';
+  }
+
+  /** An account the Fable focus may settle on: a Claude subscription Anthropic
+   * meters Fable for (no backend gateway), taking new work. */
+  _fableFocusCandidate(/** @type {Record<string, any>|null|undefined} */ a) {
+    return !!a && providerOf(a) === DEFAULT_PROVIDER && a.type === 'oauth' && !a.upstream && !a.disabled && !a.cordoned;
+  }
+
+  /** The Fable week left on `account`, in ms, or null when its reset is unknown. */
+  _fableWeekLeft(/** @type {Record<string, any>} */ account, now = Date.now()) {
+    const q = account.quota;
+    const reset = q.unified7dFable != null ? q.unified7dFableReset : q.unified7dReset;
+    return Number.isFinite(reset) ? reset - now : null;
+  }
+
+  /** Fable resets on `account` the focus would spend: held, and with enough of the week left to use them. */
+  _fableFocusResets(/** @type {Record<string, any>} */ account, now = Date.now()) {
+    const left = this._fableWeekLeft(account, now);
+    return left != null && left >= FABLE_FOCUS_MIN_LEFT_MS ? heldFableResets(account.quota, now) : 0;
+  }
+
+  /** Whether `account`'s own Fable weekly is spent and a Fable reset it holds
+   * would put it back: the case where the focus waits for a reset rather than
+   * moving on. Its threshold is the lower of the switch threshold and its cap,
+   * the ceiling rotation itself stops at. */
+  _fableFocusRestorable(/** @type {Record<string, any>} */ account, now = Date.now()) {
+    if (!this._fableFocusCandidate(account) || account.status === 'error' || account.autoRedeemReset === false) return false;
+    if (account._fableFocusHoldUntil && now < account._fableFocusHoldUntil) return false;
+    if (this._fableFocusResets(account, now) < 1) return false;
+    const used = account.quota.unified7dFable;
+    const cap = resolveMaxUsage(account.maxUsage, 'unified7dFable');
+    const limit = Math.min(this.thresholdFor('unified7dFable', account), cap ?? 1);
+    return used != null && used >= limit;
+  }
+
+  /**
+   * The account Fable is concentrated on, or null when the switch is off or no
+   * account can serve Fable. Sticky: it stays while it can serve Fable, or
+   * while a Fable reset it holds would put it back, and moves only then.
+   */
+  _fableFocusAccount(now = Date.now()) {
+    if (!this.fableFocus) return null;
+    const held = this.accounts.find(a => a.name === this._fableFocusName);
+    if (held && this._fableFocusCandidate(held)
+      && (this._isAvailable(held, FABLE_FOCUS_SAMPLE) || this._fableFocusRestorable(held, now))) return held;
+    const next = this.accounts
+      .filter(a => this._fableFocusCandidate(a) && this._isAvailable(a, FABLE_FOCUS_SAMPLE))
+      .sort((a, b) => this._fableFocusResets(b, now) - this._fableFocusResets(a, now)
+        || (a.quota.unified7d ?? 0) - (b.quota.unified7d ?? 0)
+        || a.index - b.index)[0] || null;
+    if ((next?.name ?? null) !== (this._fableFocusName ?? null)) {
+      this._fableFocusName = next?.name ?? null;
+      console.log(next
+        ? `[TeamClaude] Fable focus: "${safeLine(next.name, 64)}" (${heldFableResets(next.quota, now)} Fable resets held)`
+        : '[TeamClaude] Fable focus: no account can serve Fable right now');
+    }
+    return next;
+  }
+
+  /** On a Fable request: when the focus account's Fable weekly is spent and a
+   * Fable reset would put it back, ask for one, once at a time. */
+  _fableFocusAskReset(now = Date.now()) {
+    const focus = this._fableFocusAccount(now);
+    if (!focus || !this._onFableFocusSpent || focus._fableFocusAsking) return;
+    if (this._isAvailable(focus, FABLE_FOCUS_SAMPLE) || !this._fableFocusRestorable(focus, now)) return;
+    focus._fableFocusAsking = true;
+    const hold = () => { focus._fableFocusHoldUntil = Date.now() + FABLE_FOCUS_DECLINED_HOLD_MS; };
+    Promise.resolve()
+      .then(() => this._onFableFocusSpent?.(focus))
+      .then(r => { if (!r?.redeemed) hold(); }, hold)
+      .finally(() => { focus._fableFocusAsking = false; });
+  }
+
+  /** `exclude` plus the focus account, for a request the focus keeps off it;
+   * null when there is nothing to set aside. A request with a Fable advisor
+   * spends Fable too, so it is not kept off. */
+  _fableFocusAvoid(/** @type {Set<number>|null} */ exclude, /** @type {string|null} */ model, /** @type {string|null} */ advisorModel) {
+    if (!this.fableFocus || !model || this._isFableModel(model) || this._isFableModel(advisorModel)) return null;
+    const focus = this._fableFocusAccount();
+    if (!focus || exclude?.has(focus.index)) return null;
+    return new Set([...(exclude ?? []), focus.index]);
+  }
+
+  /**
    * With `preferSoonestWeeklyReset` on, the available account of the same
    * priority whose governing weekly window resets soonest, when that is
    * strictly sooner (by more than a minute, so jitter in reported reset times
@@ -4479,7 +4627,14 @@ export class AccountManager {
   }
 
   _pinnedFor(model) {
-    if (!model || !this.routePins.size) return null;
+    if (!model) return null;
+    // A manual pin wins; Fable focus otherwise sends Fable where a pin would.
+    return this._manualPinFor(model) || (this._isFableModel(model) ? this._fableFocusAccount() : null);
+  }
+
+  /** The account a manual route pin (routePins) sends `model` to, or null. */
+  _manualPinFor(model) {
+    if (!this.routePins.size) return null;
     const route = this._routeForModel(model);
     if (route) {
       const idx = this.routePins.get(route.name);

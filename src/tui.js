@@ -1357,6 +1357,19 @@ export class TUI {
       enter: () => this._toggleAutoRedeemResets(),
     });
 
+    // Fable focus: concentrate Fable on one account and spend its Fable resets
+    // once its Fable weekly is spent (AccountManager.setFableFocus). On this
+    // screen for the same reason as Auto-redeem: it spends resets.
+    fields.push({
+      id: 'fableFocus',
+      label: 'Fable focus',
+      hint: '←→ toggle',
+      value: () => (this.config.fableFocus === true ? green('on') : gray('off')),
+      left: () => this._toggleFableFocus(),
+      right: () => this._toggleFableFocus(),
+      enter: () => this._toggleFableFocus(),
+    });
+
     fields.push({
       id: 'probe',
       label: 'Quota probe',
@@ -2192,6 +2205,20 @@ export class TUI {
     this.config.autoRedeemResets = next;
     if (!await this._saveSetting('auto-redeem', () => { this.config.autoRedeemResets = prev; })) return;
     this._addLog(`Auto-redeem reset credits (Codex and Claude): ${next ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleFableFocus() {
+    // The manager reads its own flag per selection and the redeemer the shared
+    // config per spend: both are set, and the save is what survives a restart.
+    // An attached dashboard's manager has no setter; the server picks the
+    // saved value up on reload.
+    const prev = this.config.fableFocus;
+    const next = prev !== true;
+    this.config.fableFocus = next;
+    this.am.setFableFocus?.(next);
+    if (!await this._saveSetting('Fable focus', () => { this.config.fableFocus = prev; this.am.setFableFocus?.(prev === true); })) return;
+    this._addLog(`Fable focus: ${next ? 'on — Fable goes to one account, and its Fable resets are spent once its Fable weekly is full' : 'off'}`);
     if (this.running) this.render();
   }
 
@@ -3525,6 +3552,9 @@ export class TUI {
     lines.push(row(byId('autoRedeemResets')));
     lines.push(dim('  Spend a free Codex rate-limit reset credit when the whole pool'));
     lines.push(dim('  is dry. Irreversible and scarce — off unless you say otherwise.'));
+    lines.push(row(byId('fableFocus')));
+    lines.push(dim('  Send Fable to one account and keep other models off it; spend its'));
+    lines.push(dim('  Fable resets only once its Fable weekly is full.'));
     lines.push('');
     // ── Quota probe
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));

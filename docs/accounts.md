@@ -561,6 +561,40 @@ The probe is off by default, so the count is only as fresh as the last probe:
 `p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
 it once.
 
+### Fable focus
+
+A Fable reset gives back only what Fable used of the shared weekly, and Fable
+may use at most half of it. So a Fable reset is worth the most on an account
+whose Fable weekly is full and whose weekly holds little else. Spent on an
+account that has used 20% of its week on Fable and 80% on Opus, it leaves the
+weekly at 80%.
+
+With `fableFocus: true` (or **g** → **Fable focus**), TeamClaude arranges for
+that:
+
+- **One account takes all Fable.** Every Fable request goes to the *focus*
+  account while it can serve Fable, the way a route pin would send it. A manual
+  pin still wins. The TUI's `►F7` marks it.
+- **Other models keep off it.** Opus, Sonnet and the rest go to any other
+  account that can serve them, and reach the focus only when none can. A
+  request with a Fable advisor spends Fable too, so it may go to the focus.
+- **Its Fable resets are spent when its Fable weekly is full.** Once the focus
+  account's Fable weekly reaches the switch threshold (or its `maxUsage` cap),
+  the next Fable request asks for one of its Fable resets to be spent. This
+  happens only when the next grant is a Fable reset (never a reset that would
+  also clear the shared weekly) and at least 24 hours of the Fable week are
+  left to use what it gives back. Fable goes to the ordinary rotation until the
+  reset lands.
+- **The focus moves on** when it can no longer serve Fable and no Fable reset
+  would put it back, or when a reset was declined. It moves to the account that
+  can serve Fable holding the most Fable resets it has time to use, then the
+  one with the emptiest shared weekly. Otherwise it stays put, so a better
+  account appearing later does not take Fable mid-week.
+
+`accounts[].autoRedeemReset: false` exempts an account from the spending. The
+switch is independent of `autoRedeemResets`, which spends a reset only when a
+whole pool is dry.
+
 ### Spending a Claude reset automatically
 
 With [`autoRedeemResets`](configuration.md) on — the same switch, and the same

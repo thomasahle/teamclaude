@@ -26,7 +26,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import { USAGE_URL, OAUTH_USAGE_BETA, USAGE_USER_AGENT, normalizeUsagePayload } from './oauth.js';
+import { USAGE_URL, OAUTH_USAGE_BETA, USAGE_USER_AGENT, normalizeUsagePayload, isFableReset } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { safeLine } from './safe-text.js';
 import { proxyFetch } from './upstream-fetch.js';
@@ -303,12 +303,40 @@ export class ClaudeResetRedeemer {
   }
 
   /**
+   * The Fable focus entry point (`fableFocus`, see AccountManager.setFableFocus):
+   * the account Fable is concentrated on has spent its Fable weekly, so spend
+   * ONE Fable reset on it. Only a grant that is one (isFableReset): a reset
+   * that also clears the shared weekly is worth more kept for a spent week.
+   * The switch is the decision, so no limit is asked for upstream (the focus
+   * has already read its Fable weekly as spent); `accounts[].autoRedeemReset:
+   * false` still exempts the account, and the fleet hold after any recent
+   * attempt still applies.
+   *
    * @param {Record<string, any>} account
-   * @param {number} deadline
-   * @param {{ requireLimit?: boolean }} [opts]  false only for an operator's request
    * @returns {Promise<ClaudeRedeemResult>}
    */
-  async _redeem(account, deadline, { requireLimit = true } = {}) {
+  async redeemFableForFocus(account) {
+    if (this.config?.fableFocus !== true) return { redeemed: false, reason: 'Fable focus is switched off' };
+    if (!this._isClaude(account) || !account.orgUuid || account.disabled || account.cordoned || account.autoRedeemReset === false) {
+      return { redeemed: false, reason: 'not an account Fable focus may spend on' };
+    }
+    const now = this.now();
+    if (now < this.fleetHoldUntil) return { redeemed: false, reason: 'holding off after a recent Claude reset attempt' };
+    if (now < this._stateFor(account).cooldownUntil) return { redeemed: false, reason: 'cooling down after a recent attempt on this account' };
+    if (this.inFlight) return this.inFlight;
+    const attempt = this._redeem(account, now + this.timeoutMs, { requireLimit: false, fableOnly: true, why: 'Fable focus: its Fable weekly is spent' })
+      .finally(() => { this.inFlight = null; });
+    this.inFlight = attempt;
+    return attempt;
+  }
+
+  /**
+   * @param {Record<string, any>} account
+   * @param {number} deadline
+   * @param {{ requireLimit?: boolean, fableOnly?: boolean, why?: string }} [opts]  requireLimit false only for an operator's request or the Fable focus; fableOnly spends only a Fable reset; why is what the log and the result say
+   * @returns {Promise<ClaudeRedeemResult>}
+   */
+  async _redeem(account, deadline, { requireLimit = true, fableOnly = false, why = requireLimit ? 'no Claude account can serve the request' : 'requested by an operator' } = {}) {
     const name = safeLine(account.name, 64);
     const state = this._stateFor(account);
     const now = this.now();
@@ -330,6 +358,10 @@ export class ClaudeResetRedeemer {
     if (!grant) {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: 'holds no usable reset' };
+    }
+    if (fableOnly && !isFableReset(grant.clears)) {
+      state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
+      return { redeemed: false, account: name, reason: 'its next reset is not a Fable reset' };
     }
     if (requireLimit) {
       if (!status.atLimit || !status.exhausted.length) {
@@ -358,7 +390,7 @@ export class ClaudeResetRedeemer {
     }
     if (state.grantId !== grant.id) { state.grantId = grant.id; state.requestId = null; }
     state.requestId ||= randomUUID();
-    this.log(`[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" — ${requireLimit ? 'no Claude account can serve the request' : 'requested by an operator'}`);
+    this.log(`[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" — ${why}`);
     const r = await this.claimFn(account, { grantId: grant.id, requestId: state.requestId }, { timeoutMs: left() });
 
     if (r?.error) {
@@ -376,7 +408,7 @@ export class ClaudeResetRedeemer {
       this._holdFleet(account, now + SUCCESS_HOLD_MS);
       this.log(`[TeamClaude] Redeemed a Claude usage-limit reset on "${name}" — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
       await this._reapply(account, deadline);
-      return { redeemed: true, account: name, reason: requireLimit ? 'no Claude account could serve the request' : 'requested by an operator', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
+      return { redeemed: true, account: name, reason: why, result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
     }
     state.cooldownUntil = r.result === 'cooldown' && r.cooldownUntil ? r.cooldownUntil : now + DECLINED_COOLDOWN_MS;
     this.log(`[TeamClaude] Claude reset on "${name}" declined upstream (${r.result || 'no result'}${r.reason ? `: ${r.reason}` : ''}); nothing was spent`);
