@@ -46,7 +46,7 @@ const grant = over => ({ ...LIVE_BLOCK.grants[0], ...over });
 // ── reading the block ───────────────────────────────────────────────────────
 
 test('the live payload reads as one reset, spendable now, with its expiry', () => {
-  assert.deepEqual(bankedResets(LIVE_BLOCK, NOW), { available: 1, applicable: 1, expiresAt: ENDS, fable: 0 });
+  assert.deepEqual(bankedResets(LIVE_BLOCK, NOW), { available: 1, applicable: 1, expiresAt: ENDS, fable: 0, nextFable: null });
 });
 
 test('the probe payload carries the reading beside the quota buckets', () => {
@@ -72,9 +72,9 @@ test('a block that says nothing usable is no reading, not zero', () => {
 });
 
 test('an eligible block with no live grant is a real zero', () => {
-  assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [] }, NOW), { available: 0, applicable: 0, expiresAt: null, fable: 0 });
+  assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [] }, NOW), { available: 0, applicable: 0, expiresAt: null, fable: 0, nextFable: null });
   assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [grant({ resets_left: 0 })] }, NOW),
-    { available: 0, applicable: 0, expiresAt: null, fable: 0 });
+    { available: 0, applicable: 0, expiresAt: null, fable: 0, nextFable: null });
 });
 
 test('an expired grant is not counted', () => {
@@ -84,15 +84,15 @@ test('an expired grant is not counted', () => {
 
 test('a grant held but not spendable yet counts as held, not applicable', () => {
   assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [grant({ usable_now: false })] }, NOW),
-    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0 });
+    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0, nextFable: null });
   assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [grant({ paused: true })] }, NOW),
-    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0 });
+    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0, nextFable: null });
 });
 
 test('several grants sum, and the soonest expiry is the one reported', () => {
   const sooner = '2026-10-10T00:00:00+00:00';
   const r = bankedResets({ ...LIVE_BLOCK, grants: [grant({}), grant({ ends_at: sooner, usable_now: false })] }, NOW);
-  assert.deepEqual(r, { available: 2, applicable: 1, expiresAt: Date.parse(sooner), fable: 0 });
+  assert.deepEqual(r, { available: 2, applicable: 1, expiresAt: Date.parse(sooner), fable: 0, nextFable: null });
 });
 
 test('malformed or hostile counts cannot reach the display rows', () => {

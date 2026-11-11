@@ -223,7 +223,7 @@ const underOne = v => v != null && v < 1;
  *
  * @typedef {object} CodexLearnedQuota
  * @property {string} [planType]  the Codex subscription tier
- * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
+ * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, fable?: number, nextFable?: boolean|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  */
@@ -3600,8 +3600,9 @@ export class AccountManager {
    *    the ordinary walk until the reset lands;
    *  - otherwise the focus moves on (_fableFocusAccount): to an account that
    *    can serve Fable, first one whose shared weekly has room for the rest of
-   *    its Fable allowance, then the most Fable resets it has time to use, then
-   *    the emptiest shared weekly.
+   *    its Fable allowance, then the most Fable resets it has time to use (none
+   *    counts while a full reset is next in line ahead of them), then the
+   *    emptiest shared weekly.
    *
    * Applied live on config reload.
    * @param {boolean} enabled
@@ -3636,8 +3637,11 @@ export class AccountManager {
     return Number.isFinite(reset) ? reset - now : null;
   }
 
-  /** Fable resets on `account` the focus would spend: held, and with enough of the week left to use them. */
+  /** Fable resets on `account` the focus would spend: held, reachable (no full
+   * reset stands ahead of them, since only the grant upstream names next can
+   * be spent), and with enough of the week left to use them. */
   _fableFocusResets(/** @type {Record<string, any>} */ account, now = Date.now()) {
+    if (account.quota.resetCredits?.nextFable === false) return 0;
     const left = this._fableWeekLeft(account, now);
     return left != null && left >= FABLE_FOCUS_MIN_LEFT_MS ? heldFableResets(account.quota, now) : 0;
   }

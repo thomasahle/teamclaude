@@ -39,6 +39,7 @@ import { fetchCodexUsage } from './codex-usage.js';
 import { providerOf } from './provider.js';
 import { safeLine } from './safe-text.js';
 import { proxyFetch } from './upstream-fetch.js';
+import { resetRef } from './reset-list.js';
 
 export const CODEX_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
 export const CODEX_RESET_CREDITS_CONSUME_URL = `${CODEX_RESET_CREDITS_URL}/consume`;
@@ -487,10 +488,15 @@ export class ResetCreditRedeemer {
    * are read fresh rather than from the six-hour cache, since "what does this
    * account hold right now" is the question being asked.
    *
+   * `expect` is the `ref` (reset-list.js resetRef) of the credit the operator
+   * was shown and confirmed; when another credit would be spent by now,
+   * nothing is.
+   *
    * @param {Record<string, any>} account
+   * @param {{ expect?: string|null }} [opts]
    * @returns {Promise<RedeemResult & {creditsLeft?: number}>}
    */
-  async redeemOnRequest(account) {
+  async redeemOnRequest(account, { expect = null } = {}) {
     if (providerOf(account) !== 'codex' || !account?.accountId) {
       return { redeemed: false, reason: 'not a Codex OAuth account' };
     }
@@ -507,6 +513,9 @@ export class ResetCreditRedeemer {
     const credit = redeemableCredit(rows);
     if (!credit) return { redeemed: false, reason: 'holds no redeemable reset credit', creditsLeft: 0 };
     const held = rows.filter(row => row.status === 'available' && row.supportedByPlan !== false).length;
+    if (expect != null && resetRef(credit.id) !== expect) {
+      return { redeemed: false, reason: 'the credit next in line is no longer the one listed, so nothing was spent; list the resets again', creditsLeft: held };
+    }
     const result = await this._consume(account, state,
       { redeem: true, reason: 'requested by an operator', creditId: credit.id }, now, deadline);
     return { ...result, creditsLeft: result.redeemed ? Math.max(0, held - 1) : held };

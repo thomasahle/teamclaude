@@ -735,13 +735,18 @@ export function normalizeUsagePayload(data, now = Date.now()) {
  * be a claim the payload does not make. An eligible block with no live grant is
  * a real zero: the reset was spent or has expired.
  *
- * Grant ids (and the payload's `next_grant_id`) are never read here. They are
- * the handle that spends a reset: only the opt-in redeemer (claude-resets.js)
- * reads them, from a fresh status of its own, and none is ever stored.
+ *  - `nextFable` says whether the grant upstream would spend next
+ *    (`next_grant_id`) is a Fable reset: false when a full reset stands ahead
+ *    of the Fable ones, which can then not be spent until it is (a claim may
+ *    only name the next grant). Null when no grant is named next.
+ *
+ * Grant ids are compared here only to find the next grant's kind; none is
+ * kept. They are the handle that spends a reset: only the opt-in redeemer
+ * (claude-resets.js) uses them, from a fresh status of its own.
  *
  * @param {any} block  the payload's `cedar_ember` object
  * @param {number} [now]  ms epoch a grant's expiry is measured against
- * @returns {{available: number, applicable: number, expiresAt: number|null, fable: number}|null}
+ * @returns {{available: number, applicable: number, expiresAt: number|null, fable: number, nextFable: boolean|null}|null}
  */
 export function bankedResets(block, now = Date.now()) {
   if (!block || typeof block !== 'object' || block.eligible !== true) return null;
@@ -751,12 +756,15 @@ export function bankedResets(block, now = Date.now()) {
   let fable = 0;
   /** @type {number|null} */
   let expiresAt = null;
+  /** @type {boolean|null} */
+  let nextFable = null;
   for (const grant of block.grants) {
     if (!grant || typeof grant !== 'object') continue;
     const left = creditCount(grant.resets_left);
     if (!left) continue;
     const ends = typeof grant.ends_at === 'string' ? Date.parse(grant.ends_at) : NaN;
     if (Number.isFinite(ends) && ends <= now) continue;
+    if (typeof block.next_grant_id === 'string' && grant.id === block.next_grant_id) nextFable = isFableReset(grant.clears);
     available += left;
     if (grant.usable_now === true && grant.paused !== true) applicable += left;
     if (isFableReset(grant.clears)) fable += left;
@@ -768,6 +776,7 @@ export function bankedResets(block, now = Date.now()) {
     applicable: creditCount(applicable) ?? 0,
     expiresAt,
     fable: creditCount(fable) ?? 0,
+    nextFable,
   };
 }
 

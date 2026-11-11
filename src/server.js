@@ -1226,9 +1226,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
         const names = () => (accountManager.accounts || []).map((/** @type {Record<string, any>} */ a) => a.name);
         let target;
+        /** @type {string|null} */
+        let expect = null;
         try {
           const raw = await readControlBody(req);
-          target = JSON.parse(raw || '{}')?.account;
+          const body = JSON.parse(raw || '{}');
+          target = body?.account;
+          if (typeof body?.expect === 'string' && /^[0-9a-f]{12}$/.test(body.expect)) expect = body.expect;
         } catch (err) {
           const message = /** @type {Error} */ (err).message;
           const tooLarge = message === 'body too large';
@@ -1248,7 +1252,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           return;
         }
         try {
-          const result = await hooks.redeemReset(index);
+          const result = await hooks.redeemReset(index, { expect });
           // A refused redemption (no credit, wrong provider, upstream said no)
           // is a normal answer, not a server failure: it comes back as 200 with
           // ok:false and the reason, so the CLI can print it as-is.
@@ -1258,6 +1262,49 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.error('[TeamClaude] Reset redemption failed:', /** @type {Error} */ (err).message);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'redemption failed; see the proxy log' }));
+        }
+        return;
+      }
+
+      // The banked resets each account holds, read fresh from upstream, with the
+      // one a redemption would spend marked (`teamclaude redeem` prints this
+      // before it asks). Read-only. The body may name one account.
+      if (req.method === 'POST' && req.url === '/teamclaude/resets') {
+        if (!hooks.listResets) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reset listing not supported' }));
+          return;
+        }
+        const names = () => (accountManager.accounts || []).map((/** @type {Record<string, any>} */ a) => a.name);
+        let target = null;
+        try {
+          const raw = await readControlBody(req);
+          target = JSON.parse(raw || '{}')?.account ?? null;
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        /** @type {number[]|null} */
+        let indexes = null;
+        if (target != null) {
+          const index = typeof target === 'string' && target.trim() ? resolveAccountPin(accountManager, target) : null;
+          if (index == null) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: `no such account "${safeLine(String(target), 64)}"`, accounts: names() }));
+            return;
+          }
+          indexes = [index];
+        }
+        try {
+          const accounts = await hooks.listResets(indexes);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, accounts }));
+        } catch (err) {
+          console.error('[TeamClaude] Reset listing failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reset listing failed; see the proxy log' }));
         }
         return;
       }

@@ -479,10 +479,32 @@ and it applies live, so it can be armed or killed without a restart.
 Two commands drive the same machinery from a shell, for a server running as a
 background service. `teamclaude autoredeem [on|off]` reads or sets the fleet
 switch above, through the config lock, and a running server applies it at once.
-`teamclaude redeem <account>` spends ONE credit — or, on a Claude account, one banked usage-limit reset — on the named account, now, with
-no policy applied — the fleet switch can be off and the weekly window healthy —
-because naming the account is the decision. It shares the automatic path's
-safeguards for the call itself: a retry after an unread answer replays the same
+`teamclaude redeem` with no account lists the resets every account holds, read
+fresh: each one's kind (a full reset clears the shared weekly, a Fable reset
+only the Fable weekly), what it clears, how many are left, when it expires, why
+it cannot be used yet (a cooldown, a start date), and which one would be spent
+next, marked `►`, with what that would give back. Nothing is spent.
+
+```
+thomas@ahle.dk  weekly 3%, resets 17 Nov 07:00 (in 5d19h) · Fable 5%
+  ► Fable reset 1 left      expires 9 Mar 2027 08:59 (in 117d21h)
+      clears Fable
+      spent next · Fable 5% → 0%, weekly 3% → 0%
+      New model launch: one more Fable reset at 6 months' tenure
+    already spent: 1 full reset, 1 Fable reset
+```
+
+`teamclaude redeem <account>` prints that account's list and asks before it
+spends the reset marked `►` (`--yes` skips the question; without a terminal it
+spends nothing unless given `--yes`). Which reset that is, is not a choice: on a
+Claude account Anthropic names the next grant and only that one may be spent,
+so a Fable reset queued behind a full reset waits until the full reset is spent
+or expires. A Codex account spends the credit that expires soonest. The answer
+carries the listed reset's reference, so if the reset next in line changed
+between the list and the answer, nothing is spent. There is no policy beyond
+that — the fleet switch can be off and the weekly window healthy — because
+naming the account is the decision. It shares the automatic path's safeguards
+for the call itself: a retry after an unread answer replays the same
 idempotency key, so upstream answers `already_redeemed` rather than spending a
 second credit, and the automatic path holds off afterwards.
 
@@ -588,8 +610,9 @@ that:
 - **The focus moves on** when it can no longer serve Fable and no Fable reset
   would put it back, or when a reset was declined. It moves to an account that
   can serve Fable, preferring first one whose shared weekly has room for the
-  rest of its Fable allowance, then the most Fable resets it has time to use,
-  then the emptiest shared weekly. Otherwise it stays put, so a better account
+  rest of its Fable allowance, then the most Fable resets it has time to use
+  (an account whose next grant is a full reset counts none, since its Fable
+  resets cannot be spent before that one), then the emptiest shared weekly. Otherwise it stays put, so a better account
   appearing later does not take Fable mid-week.
 
 `accounts[].autoRedeemReset: false` exempts an account from the spending. The

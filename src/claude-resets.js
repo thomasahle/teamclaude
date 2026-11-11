@@ -30,6 +30,7 @@ import { USAGE_URL, OAUTH_USAGE_BETA, USAGE_USER_AGENT, normalizeUsagePayload, i
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { safeLine } from './safe-text.js';
 import { proxyFetch } from './upstream-fetch.js';
+import { describeClaudeResets, resetKind, resetRef } from './reset-list.js';
 
 export const CLAUDE_RESET_PROGRAM = 'cedar_ember';
 const RESET_HOST = 'https://api.anthropic.com';
@@ -80,6 +81,7 @@ export function parseResetStatus(block) {
     const left = Number(g.resets_left);
     return [{
       id: g.id,
+      label: typeof g.label === 'string' ? safeLine(g.label, 120) : null,
       resetsLeft: Number.isInteger(left) && left > 0 ? left : 0,
       clears: names(g.clears),
       usableNow: g.usable_now === true,
@@ -129,7 +131,7 @@ export async function fetchClaudeResetStatus(account, { fetchImpl = proxyFetch, 
     const res = await fetchImpl(USAGE_URL, { headers: headers(account), signal: AbortSignal.timeout(timeoutMs), routing: account.routing ?? null });
     if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
     const data = await res.json();
-    return { reset: parseResetStatus(data?.cedar_ember), usage: normalizeUsagePayload(data) };
+    return { reset: parseResetStatus(data?.cedar_ember), usage: normalizeUsagePayload(data), detail: describeClaudeResets(data) };
   } catch (/** @type {any} */ err) {
     return { error: safeLine(err?.message || String(err), 120), status: null };
   }
@@ -187,7 +189,7 @@ export function blockedUntil(account, now = Date.now()) {
   return until;
 }
 
-/** @typedef {{ redeemed: boolean, reason: string, account?: string, result?: string|null, resetsLeft?: number|null, cleared?: string[] }} ClaudeRedeemResult */
+/** @typedef {{ redeemed: boolean, reason: string, account?: string, result?: string|null, resetsLeft?: number|null, cleared?: string[], grant?: { kind: string, label: string|null } }} ClaudeRedeemResult */
 
 export class ClaudeResetRedeemer {
   /**
@@ -293,13 +295,18 @@ export class ClaudeResetRedeemer {
    * fresh status, `next_grant_id` only, request id replayed after an unread
    * answer, and the automatic path holding off afterwards.
    *
+   * `expect` is the `ref` (reset-list.js resetRef) of the reset the operator
+   * was shown and confirmed: when the reset next in line is another one by
+   * now, nothing is spent.
+   *
    * @param {Record<string, any>} account
+   * @param {{ expect?: string|null }} [opts]
    * @returns {Promise<ClaudeRedeemResult>}
    */
-  async redeemOnRequest(account) {
+  async redeemOnRequest(account, { expect = null } = {}) {
     if (!this._isClaude(account)) return { redeemed: false, reason: 'not a Claude subscription account' };
     if (!account.orgUuid) return { redeemed: false, reason: 'no organization id on this account (re-run teamclaude login for it)' };
-    return this._redeem(account, this.now() + Math.max(this.timeoutMs, 30_000), { requireLimit: false });
+    return this._redeem(account, this.now() + Math.max(this.timeoutMs, 30_000), { requireLimit: false, expect });
   }
 
   /**
@@ -333,10 +340,10 @@ export class ClaudeResetRedeemer {
   /**
    * @param {Record<string, any>} account
    * @param {number} deadline
-   * @param {{ requireLimit?: boolean, fableOnly?: boolean, why?: string }} [opts]  requireLimit false only for an operator's request or the Fable focus; fableOnly spends only a Fable reset; why is what the log and the result say
+   * @param {{ requireLimit?: boolean, fableOnly?: boolean, why?: string, expect?: string|null }} [opts]  requireLimit false only for an operator's request or the Fable focus; fableOnly spends only a Fable reset; why is what the log and the result say; expect is the ref of the one reset the caller agreed to spend
    * @returns {Promise<ClaudeRedeemResult>}
    */
-  async _redeem(account, deadline, { requireLimit = true, fableOnly = false, why = requireLimit ? 'no Claude account can serve the request' : 'requested by an operator' } = {}) {
+  async _redeem(account, deadline, { requireLimit = true, fableOnly = false, why = requireLimit ? 'no Claude account can serve the request' : 'requested by an operator', expect = null } = {}) {
     const name = safeLine(account.name, 64);
     const state = this._stateFor(account);
     const now = this.now();
@@ -362,6 +369,9 @@ export class ClaudeResetRedeemer {
     if (fableOnly && !isFableReset(grant.clears)) {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: 'its next reset is not a Fable reset' };
+    }
+    if (expect != null && resetRef(grant.id) !== expect) {
+      return { redeemed: false, account: name, reason: 'the reset next in line is no longer the one listed, so nothing was spent; list the resets again' };
     }
     if (requireLimit) {
       if (!status.atLimit || !status.exhausted.length) {
@@ -408,7 +418,7 @@ export class ClaudeResetRedeemer {
       this._holdFleet(account, now + SUCCESS_HOLD_MS);
       this.log(`[TeamClaude] Redeemed a Claude usage-limit reset on "${name}" — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
       await this._reapply(account, deadline);
-      return { redeemed: true, account: name, reason: why, result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
+      return { redeemed: true, account: name, reason: why, result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared, grant: { kind: resetKind(grant.clears), label: grant.label } };
     }
     state.cooldownUntil = r.result === 'cooldown' && r.cooldownUntil ? r.cooldownUntil : now + DECLINED_COOLDOWN_MS;
     this.log(`[TeamClaude] Claude reset on "${name}" declined upstream (${r.result || 'no result'}${r.reason ? `: ${r.reason}` : ''}); nothing was spent`);

@@ -34,8 +34,9 @@ import * as alias from './alias.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
 import { CreditMonitor } from './api-credit.js';
-import { ResetCreditRedeemer } from './codex-reset-credits.js';
+import { ResetCreditRedeemer, redeemableCredit } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
+import { describeCodexCredits, formatResetList, heldSummary, limitName, nextReset, resetKindName } from './reset-list.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
@@ -1076,15 +1077,15 @@ async function serverCommand() {
   // process. One credit per call; the caller says which account. The spending
   // itself is the redeemer's (idempotency key, unread-verdict hold, re-read of
   // the quota afterwards), the same code the automatic path runs.
-  hooks.redeemReset = async (/** @type {number} */ index) => {
+  hooks.redeemReset = async (/** @type {number} */ index, /** @type {{ expect?: string|null }} */ { expect = null } = {}) => {
     const account = accountManager.accounts[index];
     if (!account) return { ok: false, error: 'no such account' };
     if (providerOf(account) !== 'codex') {
-      const r = await claudeRedeemer.redeemOnRequest(account);
+      const r = await claudeRedeemer.redeemOnRequest(account, { expect });
       if (!r.redeemed) return { ok: false, account: account.name, error: r.reason };
-      return { ok: true, account: account.name, provider: 'anthropic', cleared: r.cleared ?? [], creditsLeft: r.resetsLeft ?? 0, code: r.result ?? null };
+      return { ok: true, account: account.name, provider: 'anthropic', cleared: r.cleared ?? [], creditsLeft: r.resetsLeft ?? 0, code: r.result ?? null, grant: r.grant ?? null };
     }
-    const result = await redeemer.redeemOnRequest(account);
+    const result = await redeemer.redeemOnRequest(account, { expect });
     if (!result.redeemed) {
       return { ok: false, account: account.name, error: result.reason, ...(result.creditsLeft != null ? { creditsLeft: result.creditsLeft } : {}) };
     }
@@ -1095,6 +1096,29 @@ async function serverCommand() {
       creditsLeft: result.creditsLeft ?? 0,
       code: result.code ?? null,
     };
+  };
+  // `teamclaude redeem` lists before it spends: every banked reset each
+  // account holds, read fresh, with the one a redemption would spend marked.
+  // Read-only; third-party backends hold none and are left out.
+  hooks.listResets = async (/** @type {number[]|null} */ indexes) => {
+    const picked = indexes ? indexes.map(i => accountManager.accounts[i]).filter(Boolean)
+      : accountManager.accounts.filter((/** @type {Record<string, any>} */ a) => a.type === 'oauth' && !a.upstream);
+    return Promise.all(picked.map(async (/** @type {Record<string, any>} */ account) => {
+      const base = { account: account.name, provider: providerOf(account) };
+      if (account.type !== 'oauth' || account.upstream) return { ...base, error: 'not a subscription account; it holds no resets' };
+      try { await accountManager.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
+        return { ...base, error: `token refresh failed (${err?.message || err})` };
+      }
+      if (providerOf(account) === 'codex') {
+        const read = await redeemer.detailsFn(account, { timeoutMs: 15_000 });
+        if (read.error) return { ...base, error: read.error };
+        return { ...base, codex: describeCodexCredits(read.credits, redeemableCredit(read.credits)?.id ?? null) };
+      }
+      const read = await claudeRedeemer.statusFn(account, { timeoutMs: 15_000 });
+      if (read?.error) return { ...base, error: read.error };
+      if (read.usage && !read.usage.error) accountManager.applyUsageData(account.index, read.usage);
+      return read.detail ? { ...base, claude: read.detail } : { ...base, error: 'the usage reply carried no reset block' };
+    }));
   };
   prober.start();
   // A money cap (accounts[].maxSpend) is judged against the month-to-date
@@ -1942,42 +1966,75 @@ async function dashboardCommand() {
 
 // ── switch ──────────────────────────────────────────────────
 
-// Spend one banked Codex rate-limit reset credit on a RUNNING server — the
-// headless equivalent of `/usage` → "Redeem reset" in a Codex client signed in
-// to that account. The server does the spending (it holds the fresh token);
-// this command only names the account and prints the answer. One credit per
-// invocation, always explicit: a reset is irreversible, and which account to
-// spend it on is a decision, not a schedule.
+// `teamclaude redeem [account] [--yes]` against a RUNNING server: list the
+// banked resets an account holds (every account, with no name) and spend the
+// one marked next after asking. The server does the reading and the spending
+// (it holds the fresh tokens); this command only names the account, shows the
+// list and asks. One reset per invocation, always explicit: a reset is
+// irreversible, and which account to spend it on is a decision, not a
+// schedule. The confirmation carries the listed reset's ref, so the server
+// spends nothing if the reset next in line changed in between.
 async function redeemCommand() {
   const config = await loadOrCreateConfig();
   const port = config.proxy.port;
-  const headers = { 'x-api-key': config.proxy.apiKey };
-  const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
-  if (!name) {
-    console.error('Usage: teamclaude redeem <account>   (spends ONE banked reset on that Claude or Codex account)');
-    console.error('See held credits with: teamclaude status');
+  const headers = { 'x-api-key': config.proxy.apiKey, 'Content-Type': 'application/json' };
+  const rest = args.slice(1);
+  const yes = rest.includes('--yes') || rest.includes('-y');
+  const name = rest.find(a => !a.startsWith('-')) ?? null;
+  const color = process.stdout.isTTY && !process.env.NO_COLOR;
+  const post = async (/** @type {string} */ path, /** @type {object} */ body) => {
+    const res = await fetch(`http://localhost:${port}${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
+    return { res, data: await res.json().catch(() => ({})) };
+  };
+  const fail = (/** @type {{ res: Response, data: any }} */ { res, data }, /** @type {string} */ what) => {
+    const detail = typeof data.error === 'string' ? data.error : null;
+    console.error(detail || `${what} failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+    if (!detail || (res.status === 404 && !data.accounts)) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+    if (data.accounts?.length && typeof data.accounts[0] === 'string') {
+      console.error('Known accounts:');
+      for (const n of data.accounts) console.error(`  ${n}`);
+    }
     process.exit(1);
-  }
+  };
   try {
-    const res = await fetch(`http://localhost:${port}/teamclaude/redeem`, {
-      method: 'POST',
-      headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ account: name }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) {
-      const detail = typeof data.error === 'string' ? data.error : null;
-      console.error(detail || `Redeem failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
-      if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
-      if (data.accounts?.length) {
-        console.error('Known accounts:');
-        for (const n of data.accounts) console.error(`  ${n}`);
-      }
+    const listed = await post('/teamclaude/resets', name ? { account: name } : {});
+    if (!listed.res.ok || !listed.data.ok) fail(listed, 'Listing resets');
+    const entries = listed.data.accounts || [];
+    console.log(formatResetList(entries, { color }));
+    if (!name) {
+      console.log('\nSpend one with: teamclaude redeem <account>');
+      return;
+    }
+    const entry = entries[0];
+    if (!entry || entry.error) process.exit(1);
+    const next = nextReset(entry);
+    if (!next) {
+      console.error(`\nNothing can be spent on "${entry.account}" right now.`);
       process.exit(1);
     }
+    const what = `the ${resetKindName(next).toLowerCase().replace('fable', 'Fable')}${next.label ? ` "${next.label}"` : ''}`;
+    if (!yes) {
+      if (!process.stdin.isTTY) {
+        console.error(`\nNothing spent. To spend ${what} on "${entry.account}", run again with --yes.`);
+        process.exit(1);
+      }
+      const rl = createInterface({ input: process.stdin, output: process.stderr });
+      const answer = await new Promise(resolve => rl.question(`\nSpend ${what} on "${entry.account}"? It cannot be undone. [y/N] `, resolve));
+      rl.close();
+      if (!/^y(es)?$/i.test(String(answer).trim())) {
+        console.log('Nothing spent.');
+        return;
+      }
+    }
+    const spent = await post('/teamclaude/redeem', { account: entry.account, expect: next.ref });
+    if (!spent.res.ok || !spent.data.ok) fail(spent, 'Redeem');
+    const data = spent.data;
     console.log(data.provider === 'anthropic'
-      ? `Redeemed a usage-limit reset on "${data.account}": cleared ${(data.cleared || []).join(', ') || 'its limits'}, ${data.creditsLeft} reset(s) left.`
-      : `Redeemed one reset credit on "${data.account}": ${data.windowsReset} window(s) reset, ${data.creditsLeft} credit(s) left.`);
+      ? `Spent ${what} on "${data.account}": cleared ${(data.cleared || []).map(limitName).join(', ') || 'its limits'}.`
+      : `Spent one reset credit on "${data.account}": ${data.windowsReset} window(s) reset.`);
+    const after = await post('/teamclaude/resets', { account: entry.account }).catch(() => null);
+    const left = after?.data?.ok ? after.data.accounts?.[0] : null;
+    if (left && !left.error) console.log(`"${data.account}" still holds ${heldSummary(left)}.`);
   } catch (err) {
     console.error('Cannot connect to proxy at localhost:' + port);
     console.error('Is the server running? Start with: teamclaude server');
@@ -3180,9 +3237,11 @@ Commands:
                       TUI does); with no NAME, list accounts and mark the current
                       --session [ID] moves only that session ($CLAUDE_CODE_SESSION_ID
                       by default); --session --clear drops its pin
-  redeem <name>       Spend ONE banked reset on a Claude or Codex account (as
-                      /limit-reset in Claude Code, or '/usage' -> 'Redeem reset'
-                      in Codex); the running server does the spending
+  redeem [name]       List the banked resets each account holds (kind, what it
+                      clears, expiry, which is spent next); with a NAME, list
+                      that account's and spend the one marked next after asking
+                      (--yes skips the question). As /limit-reset in Claude
+                      Code, or '/usage' -> 'Redeem reset' in Codex
   autoredeem [on|off] Let the server spend one such reset by itself whenever no
                       account of a provider can serve a request (off by default)
   remove <name>       Remove an account (by name or email; --org to disambiguate)
