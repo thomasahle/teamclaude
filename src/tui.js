@@ -12,7 +12,7 @@ import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
-import { formatPercent, heldFableResets, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
+import { formatPercent, heldFableResets, heldResetCredits, oauthRefusedSince, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
 import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
@@ -507,10 +507,15 @@ export function routingTag(account) {
   return text ? `via ${text}` : '';
 }
 
-// The status cell's name for an errorReason code. A code it does not know keeps `error`.
-const errorLabel = (/** @type {unknown} */ code) => code === 'account_on_hold' ? 'on hold'
-  : code === 'refresh_rejected' || code === 'credential_rejected' ? 're-login'
-  : typeof code === 'string' && ACCOUNT_REFUSAL_CODES.has(code) ? 'refused' : 'error';
+// The status cell's name for an account's errorReason code. A code it does not
+// know keeps `error`. A dead token on an organization that refuses OAuth reads
+// `denied`, as the cooldown does: a re-login cannot finish until that is lifted.
+const errorLabel = (/** @type {any} */ a) => {
+  const code = a?.errorReason?.code;
+  return code === 'account_on_hold' ? 'on hold'
+    : code === 'refresh_rejected' || code === 'credential_rejected' ? (a.entitlementDenial ? 'denied' : 're-login')
+    : typeof code === 'string' && ACCOUNT_REFUSAL_CODES.has(code) ? 'refused' : 'error';
+};
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
  *  Truncation drops a wide glyph that would straddle the limit, so the result
@@ -784,6 +789,7 @@ function tailText(s, w) {
  * @property {string} buf  the paste field
  * @property {string | null} error  why the last paste was refused
  * @property {string | null} notice  a one-off confirmation (the link copied again)
+ * @property {string | null} warning  why this sign-in is unlikely to finish, said before it starts
  * @property {boolean} pasting  inside a bracketed paste that has not ended yet
  * @property {string} held  the end of the last read, held back as a possible marker's start
  * @property {ReturnType<typeof setTimeout> | null} timer  the ESC wait or the paste watchdog
@@ -1923,6 +1929,14 @@ export class TUI {
     this._loggingIn = acct.name;
     const controller = new AbortController();
     this._openLogin(acct.name, controller);
+    // Upstream refuses OAuth for this organization: the sign-in page refuses
+    // it the same way and shows no code, so the flow would only time out.
+    // Said up front; the flow still runs, since the refusal may have lifted.
+    const refusedSince = oauthRefusedSince(acct);
+    if (refusedSince && this.login) {
+      this.login.warning = `Anthropic has refused OAuth for this account's organization since ${refusedSince}. `
+        + 'A paused account\'s sign-in page shows no code, so this will likely time out: check the account on claude.ai first. Esc cancels.';
+    }
     try {
       const outcome = await this.loginAccount(acct, {
         signal: controller.signal,
@@ -1951,7 +1965,7 @@ export class TUI {
    *  @param {AbortController} controller */
   _openLogin(account, controller) {
     this.login = {
-      account, controller, prompt: null, buf: '', error: null, notice: null,
+      account, controller, prompt: null, buf: '', error: null, notice: null, warning: null,
       pasting: false, held: '', timer: null, timerGen: 0,
       linkId: `teamclaude-login-${++this._loginSeq}`,
     };
@@ -2797,6 +2811,10 @@ export class TUI {
     const brand = prompt?.provider === 'codex' ? 'OpenAI' : prompt ? 'Claude' : '';
     lines.push(` ${bold(`Sign in "${safeLine(login.account, 60)}"`)}${brand ? dim(` · ${brand}`) : ''}`);
     lines.push('');
+    if (login.warning) {
+      wrapWords(login.warning, Math.max(20, W - 4)).forEach(l => lines.push(`   ${yellow(l)}`));
+      lines.push('');
+    }
     if (!prompt) {
       lines.push(dim('   Starting the sign-in...'));
       return { lines, links };
@@ -3287,7 +3305,7 @@ export class TUI {
         break;
       case 'throttled': status = yellow('throttled'); break;
       case 'exhausted': status = red('exhausted'); break;
-      case 'error':     status = red(errorLabel(a.errorReason?.code)); break;
+      case 'error':     status = red(errorLabel(a)); break;
       default:          status = a.status || 'ready';
     }
     status = rpad(status, 10);

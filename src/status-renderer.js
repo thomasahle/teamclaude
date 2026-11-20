@@ -513,6 +513,26 @@ function lastGoodRefresh(account, err) {
   return `; last good refresh ${formatAgo(account.lastRefreshAt, Date.now())}`;
 }
 
+/**
+ * How long upstream has refused OAuth for the account's organization (the
+ * entitlement denial that stays on the account until a request is served
+ * again), as "8d ago"; null when it has not. Such an organization refuses a
+ * sign-in too: claude.ai shows a paused account no code, so a re-login cannot
+ * finish until the refusal is lifted.
+ * @param {any} account
+ * @param {number} [now]
+ * @returns {string|null}
+ */
+export function oauthRefusedSince(account, now = Date.now()) {
+  const denial = account?.entitlementDenial;
+  if (!denial) return null;
+  // The payload can come from another process: only a real time is shown.
+  return Number.isFinite(denial.since) ? formatAgo(Math.min(denial.since, now), now) : 'a while';
+}
+
+/** A token that is dead and wants a sign-in to replace it. @param {any} err */
+const deadToken = err => err?.code === 'refresh_rejected' || err?.code === 'credential_rejected';
+
 
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
@@ -526,8 +546,13 @@ export function unavailableLine(account, paint) {
   // whatever `unavailable` says, short of the operator's own disable.
   const refused = reason !== 'disabled' && isRefused(account);
   const err = reason === 'error' ? account.errorReason : null;
+  // A dead token on an organization that refuses OAuth: the command alone
+  // would send the operator to a sign-in that never hands out a code.
+  const orgRefused = deadToken(err) ? oauthRefusedSince(account) : null;
   const text = refused ? refusalText(account.errorReason)
     : !err ? UNAVAILABLE_TEXT[reason] || safeLine(reason, 64)
+    : orgRefused ? `needs a re-login (${safeLine(err.detail, 120)}), which cannot finish while its organization refuses OAuth `
+      + `(since ${orgRefused}; a paused account's sign-in shows no code) — check the account on claude.ai; once it is lifted, run: ${safeLine(err.remedy, 40)}`
     : `needs a re-login: ${safeLine(err.detail, 120)}${lastGoodRefresh(account, err)} — run: ${safeLine(err.remedy, 40)}`;
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line

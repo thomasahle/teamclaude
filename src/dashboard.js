@@ -748,7 +748,12 @@ export function problems(status) {
     // alone; any error code other than the two dead-token ones is one.
     var code = a.errorReason && a.errorReason.code;
     var refused = a.unavailable === 'error' && code && code !== 'refresh_rejected' && code !== 'credential_rejected';
-    var why = refused ? 'was refused by upstream' : ATTENTION[a.unavailable];
+    // A dead token on an organization that refuses OAuth: the sign-in is
+    // refused too (a paused account is shown no code), so say what comes first.
+    var orgRefused = a.unavailable === 'error' && !refused && a.entitlementDenial;
+    var why = refused ? 'was refused by upstream'
+      : orgRefused ? 'needs a re-login, which cannot finish while its organization refuses OAuth: check the account on claude.ai'
+      : ATTENTION[a.unavailable];
     if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
   });
 

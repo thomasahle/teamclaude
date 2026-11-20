@@ -572,6 +572,18 @@ test('only the account states that need a person are reported', () => {
   assert.doesNotMatch(refused[0].text, /re-login/);
 });
 
+test('a dead token on an organization that refuses OAuth says the sign-in waits on that', () => {
+  const paused = problems(fleetStatus(am => {
+    am.accounts[0].status = 'error';
+    am.accounts[0].errorReason = { code: 'refresh_rejected', detail: 'upstream rejected its refresh token (400)', remedy: 'teamclaude login' };
+    am.markEntitlementDenied(0, { detail: 'OAuth authentication is currently not allowed for this organization.' });
+    am.accounts[0].entitlementDeniedUntil = null;
+  }));
+  assert.deepEqual(paused.map(p => p.kind), ['account']);
+  assert.match(paused[0].text, /needs a re-login, which cannot finish while its organization refuses OAuth: check the account on claude\.ai/);
+  assert.doesNotMatch(paused[0].text, /was refused by upstream/);
+});
+
 test('overage spend is not a banner line', () => {
   // usedMinor is month-to-date, so once overage is switched on this would be lit
   // for most of the month. The account card and `teamclaude status` carry it,

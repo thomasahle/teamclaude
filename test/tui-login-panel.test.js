@@ -384,3 +384,24 @@ test('login panel: a closing marker with no opening one keeps what came before i
   assert.equal(tui.login.buf, 'abc#state');
   assert.equal(tui.login.pasting, false);
 });
+
+test('login panel: an account whose organization refuses OAuth is warned about before the sign-in, which still runs', () => {
+  const flow = fakeFlow();
+  const tui = makeTUI({ loginAccount: flow.loginAccount });
+  tui.am.accounts[0].entitlementDenial = { detail: 'OAuth authentication is currently not allowed for this organization.', since: Date.now() - 3 * 86400_000, count: 52 };
+  tui.running = true;
+  captureStdout(() => openPanel(tui));
+  assert.equal(flow.calls, 1, 'the flow still starts: the refusal may have been lifted');
+  const text = stripAnsi(withoutLinks(frame(tui, { columns: 100, rows: 40 }))).replace(/\s+/g, ' ');
+  assert.match(text, /Anthropic has refused OAuth for this account's organization since 3d ago/);
+  assert.match(text, /check the account on claude\.ai first/);
+  assert.match(text, /Open the OpenAI sign-in page:/);
+});
+
+test('login panel: no warning for an account upstream has not refused', () => {
+  const flow = fakeFlow();
+  const tui = makeTUI({ loginAccount: flow.loginAccount });
+  tui.running = true;
+  captureStdout(() => openPanel(tui));
+  assert.doesNotMatch(stripAnsi(withoutLinks(frame(tui, { rows: 40 }))), /refused OAuth/);
+});

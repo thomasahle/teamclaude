@@ -154,3 +154,49 @@ test('live, the line asks the manager whether the account bills on extra usage, 
   am.onExtraUsage = (i) => i === 0;
   assert.match(listed(am).slice(1, 4).join(' ').replace(/\s+/g, ' '), /serving on extra usage \(paid overage\), billing/);
 });
+
+// A paused account answers every request "OAuth authentication is currently not
+// allowed for this organization", and its sign-in page shows no code. Once its
+// token dies too, `run: teamclaude login` sent the operator to a sign-in that
+// could only time out.
+const PAUSED = 'OAuth authentication is currently not allowed for this organization.';
+
+/** The refused-refresh fleet, its dead account also refused OAuth since `ago` ms. */
+async function pausedRefresh(ago = 8 * 24 * h) {
+  const am = await refusedRefresh();
+  am.markEntitlementDenied(0, { detail: PAUSED });
+  // The cooldown has run out, as it has on a fleet that kept retrying: what
+  // stays is the denial on record and the dead token.
+  am.accounts[0].entitlementDeniedUntil = null;
+  am.accounts[0].entitlementDenial.since = Date.now() - ago;
+  return am;
+}
+
+test('a dead token on an organization that refuses OAuth reads denied, and says what has to change first', async () => {
+  const lines = listed(await pausedRefresh());
+  const at = rowOf(lines, 'dead@x.com');
+  assert.match(lines[at], /denied/);
+  assert.doesNotMatch(lines[at], /re-login/);
+  const why = lines.slice(at + 1, rowOf(lines, 'fine@x.com')).map(l => l.trim()).join(' ');
+  assert.match(why, /needs a re-login \(upstream rejected its refresh token \(400\)\), which cannot finish while its organization refuses OAuth/);
+  assert.match(why, /since 8d ago/);
+  assert.match(why, /check the account on claude\.ai; once it is lifted, run: teamclaude login/);
+});
+
+test('attach mode says the same off the status payload', async () => {
+  const remote = new RemoteAccountManager();
+  remote.applyStatus((await pausedRefresh()).getStatus());
+  const lines = listed(remote);
+  const at = rowOf(lines, 'dead@x.com');
+  assert.match(lines[at], /denied/);
+  assert.match(lines.slice(at + 1).join(' '), /cannot finish while its organization refuses OAuth/);
+});
+
+test('a refusal with no time on record still reads, without a made-up date', async () => {
+  const remote = new RemoteAccountManager();
+  const status = (await pausedRefresh()).getStatus();
+  status.accounts[0].entitlementDenial.since = 'yesterday';
+  remote.applyStatus(status);
+  const lines = listed(remote);
+  assert.match(lines.slice(rowOf(lines, 'dead@x.com') + 1).join(' ').replace(/\s+/g, ' '), /since a while/);
+});
